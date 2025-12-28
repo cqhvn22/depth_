@@ -13,26 +13,64 @@ def safe_read(cam):
         grabbed, frame = cam.read()
     except Exception:
         return False, None
-    return grabbed, frame
+    if not grabbed or frame is None:
+        return False, None
+    return True, frame
 
-def take_and_save_pair(left_cam, right_cam, out_dir):
-    grabbed_l, left_frame = safe_read(left_cam)
-    grabbed_r, right_frame = safe_read(right_cam)
+def wait_for_frame(cam, timeout=1.0, interval=0.05):
+    """
+    Try to obtain a valid frame from cam within timeout seconds.
+    Returns (True, frame) or (False, None).
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        ok, frame = safe_read(cam)
+        if ok:
+            return True, frame
+        time.sleep(interval)
+    return False, None
 
-    if not grabbed_l or left_frame is None:
-        print("Warning: left frame not available, skipping save")
+def take_and_save_pair(left_cam, right_cam, out_dir, timeout=1.0):
+    """
+    Attempt to get a fresh frame from both cameras (with short waiting).
+    Save into out_dir/left and out_dir/right. Returns True if both saved.
+    """
+    left_dir = os.path.join(out_dir, "left")
+    right_dir = os.path.join(out_dir, "right")
+    ensure_dir(left_dir)
+    ensure_dir(right_dir)
+
+    ok_l, left_frame = wait_for_frame(left_cam, timeout=timeout)
+    ok_r, right_frame = wait_for_frame(right_cam, timeout=timeout)
+
+    if not ok_l:
+        print("Warning: left frame not available (timeout), skipping save")
         return False
-    if not grabbed_r or right_frame is None:
-        print("Warning: right frame not available, skipping save")
+    if not ok_r:
+        print("Warning: right frame not available (timeout), skipping save")
         return False
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    left_path = os.path.join(out_dir, f"left_{ts}.png")
-    right_path = os.path.join(out_dir, f"right_{ts}.png")
+    left_path = os.path.join(left_dir, f"left_{ts}.png")
+    right_path = os.path.join(right_dir, f"right_{ts}.png")
 
-    cv2.imwrite(left_path, left_frame)
-    cv2.imwrite(right_path, right_frame)
-    print(f"Saved: {left_path}  {right_path}")
+    # Attempt to write and verify success
+    ok_write_l = cv2.imwrite(left_path, left_frame)
+    ok_write_r = cv2.imwrite(right_path, right_frame)
+
+    if not ok_write_l or not ok_write_r:
+        print(f"Error: failed to write images. left_ok={ok_write_l} right_ok={ok_write_r}")
+        # Clean up any partial file
+        try:
+            if os.path.exists(left_path) and not ok_write_l:
+                os.remove(left_path)
+            if os.path.exists(right_path) and not ok_write_r:
+                os.remove(right_path)
+        except Exception:
+            pass
+        return False
+
+    print(f"Saved stereo pair:\n  {left_path}\n  {right_path}")
     return True
 
 def main():
@@ -58,19 +96,25 @@ def main():
 
         print("Press 's' or Space to save a stereo pair. ESC to exit.")
         while True:
-            _, limg = safe_read(left)
-            _, rimg = safe_read(right)
+            ok_l, limg = safe_read(left)
+            ok_r, rimg = safe_read(right)
 
-            if limg is not None:
+            if ok_l and limg is not None:
                 cv2.imshow("Cam Left", limg)
-            if rimg is not None:
+            else:
+                # show a black frame if no image to keep window responsive
+                cv2.imshow("Cam Left", cv2.imread(os.devnull) if False else (limg if limg is not None else 255 * (np.zeros((10,10,3), dtype='uint8'))))
+
+            if ok_r and rimg is not None:
                 cv2.imshow("Cam Right", rimg)
+            else:
+                cv2.imshow("Cam Right", cv2.imread(os.devnull) if False else (rimg if rimg is not None else 255 * (np.zeros((10,10,3), dtype='uint8'))))
 
             key = cv2.waitKey(30) & 0xFF
             if key == 27:  # ESC
                 break
             if key == ord('s') or key == 32:  # 's' or Space
-                take_and_save_pair(left, right, out_dir)
+                take_and_save_pair(left, right, out_dir, timeout=1.0)
     finally:
         left.stop()
         left.release()
@@ -79,4 +123,5 @@ def main():
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
+    # Delay a bit to allow camera threads to initialize reliably on startup
     main()
