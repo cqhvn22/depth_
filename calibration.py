@@ -6,7 +6,7 @@ import cv2 as cv
 from camera_stream import Camera
 
 # Calibration params (adjust as needed)
-chessboardSize = (9, 6)  # internal corners (columns, rows)
+chessboardSize = (6, 9)  # internal corners (columns, rows)
 square_size = 23  # mm (or any unit)
 criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
@@ -79,7 +79,7 @@ def run_calibration(image_dir, chessboard_size, square_size):
 
 def main():
     cam = Camera()
-    cam.open(0)
+    cam.open(sensor_id=1) #sensor_id = 0 is the right one, sensor_id = 1 is the one on the left
     cam.start()
 
     cv.namedWindow("Calibration", cv.WINDOW_AUTOSIZE)
