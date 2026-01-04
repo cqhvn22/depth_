@@ -79,7 +79,7 @@ def run_calibration(image_dir, chessboard_size, square_size):
 
 def main():
     cam = Camera()
-    cam.open(sensor_id=1) #sensor_id = 0 is the right one, sensor_id = 1 is the one on the left
+    cam.open(sensor_id=0) #sensor_id = 0 is the right one, sensor_id = 1 is the one on the left
     cam.start()
 
     cv.namedWindow("Calibration", cv.WINDOW_AUTOSIZE)
