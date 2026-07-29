@@ -16,13 +16,14 @@ class Camera:
 
     def open(self, sensor_id=0):
         # GStreamer pipeline string for capturing video from the CSI camera
-        sensor_mode = 3  # 1280x720, 59.9999 fps
-        capture_width = 1280
-        capture_height = 720
-        display_width = 1280
-        display_height = 720
-        framerate = 20
-        flip_method = 0
+        sensor_mode = 2  
+        capture_width = 1920/2
+        capture_height = 1080/2
+        display_width = 1920/2
+        display_height = 1080/2
+        framerate = 30
+        flip_method = 2
+        
         gstreamer_pipeline_string = (
             "nvarguscamerasrc sensor-id=%d sensor-mode=%d ! "
             "video/x-raw(memory:NVMM), "
@@ -93,53 +94,43 @@ class Camera:
             self.read_thread.join()
 
 
-def start_cameras():
-    # Initialize and start both cameras
-    left_camera = Camera()
-    left_camera.open(0)
-    left_camera.start()
 
-    right_camera = Camera()
-    right_camera.open(1)
-    right_camera.start()
+left_camera = Camera()
+left_camera.open(0)
+left_camera.start()
 
-    #cv2.namedWindow("CSI Cameras", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("Cam Left", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("Cam Right", cv2.WINDOW_AUTOSIZE)
+right_camera = Camera()
+right_camera.open(1)
+right_camera.start()
 
-    # Check if both cameras opened successfully
-    if not left_camera.video_capture.isOpened() or not right_camera.video_capture.isOpened():
-        print("Unable to open cameras")
-        sys.exit(0)
+#cv2.namedWindow("CSI Cameras", cv2.WINDOW_AUTOSIZE)
+cv2.namedWindow("Cam Left", cv2.WINDOW_AUTOSIZE)
+cv2.namedWindow("Cam Right", cv2.WINDOW_AUTOSIZE)
 
-    while cv2.getWindowProperty("Cam Left", 0) >= 0:
-        # Read frames from both cameras
-        _, left_image = left_camera.read()
-        _, right_image = right_camera.read()
+# Check if both cameras opened successfully
+if not left_camera.video_capture.isOpened() or not right_camera.video_capture.isOpened():
+    print("Unable to open cameras")
+    sys.exit(0)
 
-        # Concatenate the two images horizontally
-        #camera_images = np.vstack((left_image, right_image))
-        
-        
+while cv2.getWindowProperty("Cam Left", 0) >= 0:
+    # Read frames from both cameras
+    _, left_image = left_camera.read()
+    _, right_image = right_camera.read()
 
-        # Show the combined image
-        #cv2.imshow("CSI Cameras", camera_images)
-        cv2.imshow("Cam Left", left_image)
-        cv2.imshow("Cam Right", right_image)
 
-        # Check for the ESC key to exit
-        keycode = cv2.waitKey(30) & 0xFF
-        if keycode == 27:
-            break
+    #cv2.imshow("CSI Cameras", camera_images)
+    cv2.imshow("Cam Left", left_image)
+    cv2.imshow("Cam Right", right_image)
+    
+
+    # Check for the ESC key to exit
+    keycode = cv2.waitKey(30) & 0xFF
+    if keycode == 27:
+        break
 
     # Stop and release both cameras
-    left_camera.stop()
-    left_camera.release()
-    right_camera.stop()
-    right_camera.release()
-    cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    start_cameras()
-
+left_camera.stop()
+left_camera.release()
+right_camera.stop()
+right_camera.release()
+cv2.destroyAllWindows()
