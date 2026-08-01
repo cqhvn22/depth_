@@ -1,0 +1,19 @@
+stereo_camera_node:
+  ros__parameters:
+    left_sensor_id: 0
+    right_sensor_id: 1
+    sensor_mode: 2
+    capture_width: 960
+    capture_height: 540
+    output_width: 960
+    output_height: 540
+    framerate: 30
+    flip_method: 0
+    topic_prefix: stereo
+    left_frame_id: stereo_left_optical_frame
+    right_frame_id: stereo_right_optical_frame
+    left_camera_name: imx219_left_960x540
+    right_camera_name: imx219_right_960x540
+    left_camera_info_url: package://stereo_camera_ros2/config/left_camera_info.yaml
+    right_camera_info_url: package://stereo_camera_ros2/config/right_camera_info.yaml
+    publish_sync_delta: true

@@ -1,0 +1,5 @@
+icm20948_node:
+  ros__parameters:
+    i2c_device: /dev/i2c-7
+    frame_id: imu_link
+    publish_rate: 20.0
