@@ -1,6 +1,7 @@
 Place your calibration file in this directory with this exact name:
 
     stereo_calibration.npz
+    
 
 It must contain these NumPy arrays:
 
@@ -9,6 +10,11 @@ It must contain these NumPy arrays:
     right_map_x
     right_map_y
     Q
+
+
+You can use out calibration in calibration\stereo_calibration.npz
+
+
 
 Alternatively, leave the file elsewhere and pass its absolute path:
 
