@@ -68,12 +68,7 @@ A stereo calibration `.npz` file (see `../../Calibration/README.md`) is required
 
 ## Build
 
-Copy the entire `stereo_depth_node` directory into your ROS workspace `src`:
-
 ```bash
-cd ~/GitHub/camera-test-main/ROS2/stereo_camera
-cp -r /path/to/stereo_depth_node src/
-
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install --packages-select stereo_depth_node
 source install/setup.bash

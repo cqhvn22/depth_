@@ -38,7 +38,7 @@ Lenna-Stereo-Camera/
 ├── ROS/                     # ROS 2 (Humble) packages
 │   ├── stereo_camera/          # C++ camera + IMU nodes, publishes image/camera_info/imu topics
 │   └── stereo_depth_node/      # Python node, subscribes to stereo images and publishes depth
-├── Pinout.png               # Jetson Orin Nano / camera / IMU wiring reference
+├── images              
 ├── LICENSE
 └── README.md                # This file
 ```

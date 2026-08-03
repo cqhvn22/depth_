@@ -88,16 +88,7 @@ This will:
 
 ### 3. Verify calibration
 
-```bash
-python3 verify_stereo_calibration.py \
-    --calibration stereo_calibration.npz \
-    --left-dir calibration_images/left \
-    --right-dir calibration_images/right \
-    --board-size 9x6 \
-    --expected-baseline 60
-```
-
-> Note: `verify_stereo_calibration.py` is referenced by the original calibration workflow but is not currently included in this folder. Add it here if you want an automated verification step, or verify manually by checking the printed RMS errors and baseline from step 2, and by visually inspecting rectified image pairs.
+you can verify your calibration by checking rge baseline extracted and the actual baseline of IMX219-83 (60mm).
 
 ## Output
 

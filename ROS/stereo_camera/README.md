@@ -82,8 +82,6 @@ Hardware: Jetson Orin Nano, both IMX219-83 CSI sensors connected, and (optionall
 ## Build
 
 ```bash
-cd ~/GitHub/camera-test-main/ROS2/stereo_camera
-rm -rf build install log
 colcon build --symlink-install --packages-select stereo_camera_ros2
 source install/setup.bash
 ```
