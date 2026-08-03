@@ -159,5 +159,5 @@ This is the sample result of the stereo camera and IMU data.
 <p align="center">
   <img src="../../images/ROS Stereo Camera and IMU.png" alt="ROS Stereo Camera and IMU.png">
   <br>
-  <em>Ros Stereo Camera and IMU data</em>
+  <em>ROS Stereo Camera and IMU data</em>
 </p>
