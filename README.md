@@ -127,12 +127,10 @@ Refer to each subfolder's own README for full details, parameters, and troublesh
 
 ## Outputs
 
-_Sample images and output captures will be added here._
+Sample result of depth algorithm capturing the Lenna Team.
 
-<!-- Example:
-### Raw stereo capture
-![raw stereo capture](docs/images/raw_stereo.png)
-
-### Disparity / depth map
-![disparity map](docs/images/disparity.png)
--->
+<p align="center">
+  <img src="images/result.jpg" alt="result.jpg">
+  <br>
+  <em>True Friendship Builds Dreams</em>
+</p>

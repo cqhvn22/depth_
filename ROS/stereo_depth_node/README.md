@@ -131,12 +131,10 @@ The left and right images must match the resolution used to create the calibrati
 
 ## Outputs
 
-_Sample depth/disparity visualization images will be added here._
+THis the sample data of ROS depth node.
 
-<!-- Example:
-### Disparity output
-![disparity](../../docs/images/ros_stereo_depth_disparity.png)
-
-### Depth viewer
-![depth viewer](../../docs/images/ros_stereo_depth_viewer.png)
--->
+<p align="center">
+  <img src="../../images/Ros depth.png" alt="ROS depth.png">
+  <br>
+  <em>Ros depth data</em>
+</p>

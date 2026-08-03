@@ -25,7 +25,8 @@ See each package's own `README.md` for dependencies, build/run instructions, and
 
 _Sample rqt_graph / topic list screenshots will be added here._
 
-<!-- Example:
-### Node graph
-![ros node graph](../docs/images/ros_node_graph.png)
--->
+<p align="center">
+  <img src="../images/rqt_graph.png" alt="rqt_graph.png">
+  <br>
+  <em>rqt graph of stereo camera and stereo depth nodes</em>
+</p>

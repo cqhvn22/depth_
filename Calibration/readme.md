@@ -103,14 +103,12 @@ python3 verify_stereo_calibration.py \
 
 `stereo_calibration.npz` contains, among other arrays: `K_left`, `D_left`, `K_right`, `D_right` (intrinsics/distortion), `R`, `T`, `E`, `F` (stereo geometry), `R_left`, `R_right`, `P_left`, `P_right`, `Q` (rectification), and `left_map_x`/`left_map_y`/`right_map_x`/`right_map_y` (remap lookup tables). This is the file expected by `Python/stereo_depth.py`, `Python/depth_test.py`, and the ROS 2 `stereo_depth_node`.
 
-## Outputs
+## Image
 
-_Sample chessboard capture and rectification images will be added here._
+This is the chessboard we printed on an A4 paper.
 
-<!-- Example:
-### Detected chessboard corners
-![chessboard corners](../docs/images/calibration_corners.png)
-
-### Rectified stereo pair
-![rectified pair](../docs/images/rectified_pair.png)
--->
+<p align="center">
+  <img src="../images/calibration.png" alt="calibration.png">
+  <br>
+  <em>Chessboard</em>
+</p>
