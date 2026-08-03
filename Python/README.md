@@ -82,12 +82,11 @@ if ok:
 
 ## Outputs
 
-_Sample camera preview and depth/disparity visualization images will be added here._
+THis the sample data of python depth code.
 
-<!-- Example:
-### Dual camera preview
-![camera preview](../docs/images/python_camera_preview.png)
+<p align="center">
+  <img src="../images/Python depth.png" alt="Python depth.png">
+  <br>
+  <em>Python depth data</em>
+</p>
 
-### Live depth visualization
-![depth visualization](../docs/images/python_depth_test.png)
--->
