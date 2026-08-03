@@ -134,7 +134,7 @@ The left and right images must match the resolution used to create the calibrati
 This the sample data of ROS depth node.
 
 <p align="center">
-  <img src="../../images/Ros depth.png" alt="ROS depth.png">
+  <img src="../../images/ROS depth.png" alt="ROS depth.png">
   <br>
-  <em>Ros depth data</em>
+  <em>ROS depth data</em>
 </p>
