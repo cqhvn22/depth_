@@ -157,7 +157,7 @@ To regenerate the CameraInfo YAML from a new `.npz`, use `tools/npz_to_ros_camer
 This is the sample result of the stereo camera and IMU data.
 
 <p align="center">
-  <img src="../../images/ROS Stereo Camera and IMU.png" alt="ROS Stereo Camera and IMU.png">
+  <img src="..\..\images/ROS Stereo Camera and IMU.png" alt="ROS Stereo Camera and IMU.png">
   <br>
   <em>ROS Stereo Camera and IMU data</em>
 </p>
