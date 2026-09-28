@@ -1,11 +1,20 @@
-import cv2
 import threading
 import time
-import sys
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import cv2
 import numpy as np
+
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    raise ImportError(
+        "picamera2 is not installed. Install it with:\n"
+        "  sudo apt install python3-picamera2\n"
+        "or:\n"
+        "  pip install picamera2"
+    )
 
 
 @dataclass
@@ -13,7 +22,7 @@ class StereoFrame:
     left: np.ndarray
     right: np.ndarray
 
-    # Software timestamps taken immediately after retrieve().
+    # Software timestamps taken immediately after capture.
     left_timestamp: float
     right_timestamp: float
 
@@ -25,31 +34,50 @@ class StereoFrame:
 
 
 class StereoCamera:
+    """
+    Stereo camera class for Raspberry Pi 5 using picamera2.
+
+    Raspberry Pi 5 has two CSI camera ports (CAM0 and CAM1).
+    left_camera_num  → typically 0 (CAM0 port)
+    right_camera_num → typically 1 (CAM1 port)
+    """
+
     def __init__(
         self,
-        left_sensor_id: int = 0,
-        right_sensor_id: int = 1,
-        sensor_mode: int = 2,
+        left_camera_num: int = 0,
+        right_camera_num: int = 1,
         capture_width: int = 960,
         capture_height: int = 540,
-        output_width: int = 960,
-        output_height: int = 540,
         framerate: int = 30,
+        # Deprecated parameters kept for backward compatibility
+        left_sensor_id: Optional[int] = None,
+        right_sensor_id: Optional[int] = None,
+        sensor_mode: int = 2,
+        output_width: Optional[int] = None,
+        output_height: Optional[int] = None,
         flip_method: int = 0,
     ):
-        self.left_sensor_id = left_sensor_id
-        self.right_sensor_id = right_sensor_id
+        # Support old positional API (left_sensor_id / right_sensor_id)
+        if left_sensor_id is not None:
+            left_camera_num = left_sensor_id
+        if right_sensor_id is not None:
+            right_camera_num = right_sensor_id
 
-        self.sensor_mode = sensor_mode
+        self.left_camera_num = left_camera_num
+        self.right_camera_num = right_camera_num
+
         self.capture_width = capture_width
         self.capture_height = capture_height
-        self.output_width = output_width
-        self.output_height = output_height
-        self.framerate = framerate
-        self.flip_method = flip_method
 
-        self.left_capture: Optional[cv2.VideoCapture] = None
-        self.right_capture: Optional[cv2.VideoCapture] = None
+        # output size defaults to capture size (no hardware downscale needed)
+        self.output_width = output_width if output_width is not None else capture_width
+        self.output_height = output_height if output_height is not None else capture_height
+
+        self.framerate = framerate
+        self.flip_method = flip_method  # kept for compatibility, applied via cv2.rotate
+
+        self._left_cam: Optional[Picamera2] = None
+        self._right_cam: Optional[Picamera2] = None
 
         self._frame_lock = threading.Lock()
         self._capture_thread: Optional[threading.Thread] = None
@@ -58,56 +86,107 @@ class StereoCamera:
         self._sequence = 0
         self._running = False
 
-    def _gstreamer_pipeline(self, sensor_id: int) -> str:
-        return (
-            f"nvarguscamerasrc sensor-id={sensor_id} "
-            f"sensor-mode={self.sensor_mode} ! "
-            f"video/x-raw(memory:NVMM), "
-            f"width=(int){self.capture_width}, "
-            f"height=(int){self.capture_height}, "
-            f"format=(string)NV12, "
-            f"framerate=(fraction){self.framerate}/1 ! "
-            f"nvvidconv flip-method={self.flip_method} ! "
-            f"video/x-raw, "
-            f"width=(int){self.output_width}, "
-            f"height=(int){self.output_height}, "
-            f"format=(string)BGRx ! "
-            f"videoconvert ! "
-            f"video/x-raw, format=(string)BGR ! "
-            f"appsink drop=true max-buffers=1 sync=false"
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _make_config(self, cam: Picamera2) -> dict:
+        """Build a picamera2 still/video configuration."""
+        config = cam.create_video_configuration(
+            main={
+                "size": (self.capture_width, self.capture_height),
+                "format": "BGR888",
+            },
+            controls={
+                "FrameRate": float(self.framerate),
+            },
+            buffer_count=4,
         )
+        return config
+
+    def _apply_flip(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Replicate Jetson nvvidconv flip-method behaviour via OpenCV.
+
+        flip_method:
+            0 → no flip
+            1 → counterclockwise 90°
+            2 → rotate 180°
+            3 → clockwise 90°
+            4 → horizontal flip
+            5 → upper-right diagonal flip
+            6 → vertical flip
+            7 → upper-left diagonal flip
+        """
+        if self.flip_method == 0:
+            return frame
+        elif self.flip_method == 1:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif self.flip_method == 2:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        elif self.flip_method == 3:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif self.flip_method == 4:
+            return cv2.flip(frame, 1)
+        elif self.flip_method == 5:
+            return cv2.transpose(frame)
+        elif self.flip_method == 6:
+            return cv2.flip(frame, 0)
+        elif self.flip_method == 7:
+            return cv2.flip(cv2.transpose(frame), 1)
+        return frame
+
+    def _resize_if_needed(self, frame: np.ndarray) -> np.ndarray:
+        """Resize output if output resolution differs from capture resolution."""
+        if (self.output_width != self.capture_width or
+                self.output_height != self.capture_height):
+            frame = cv2.resize(
+                frame,
+                (self.output_width, self.output_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        return frame
+
+    def _grab_frame(self, cam: Picamera2) -> Tuple[np.ndarray, float]:
+        """Capture a single frame from one Picamera2 instance."""
+        frame = cam.capture_array("main")
+        timestamp = time.monotonic_ns() / 1_000_000_000.0
+
+        # picamera2 returns BGR888 directly, but ensure contiguous array
+        frame = np.ascontiguousarray(frame)
+        frame = self._apply_flip(frame)
+        frame = self._resize_if_needed(frame)
+        return frame, timestamp
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def open(self) -> bool:
         if self.is_opened():
             return True
 
-        left_pipeline = self._gstreamer_pipeline(self.left_sensor_id)
-        right_pipeline = self._gstreamer_pipeline(self.right_sensor_id)
-
-        self.left_capture = cv2.VideoCapture(
-            left_pipeline,
-            cv2.CAP_GSTREAMER,
-        )
-
-        if not self.left_capture.isOpened():
-            print("Unable to open the left camera.")
-            print("Pipeline:", left_pipeline)
+        try:
+            self._left_cam = Picamera2(camera_num=self.left_camera_num)
+            left_config = self._make_config(self._left_cam)
+            self._left_cam.configure(left_config)
+            self._left_cam.start()
+        except Exception as exc:
+            print(f"Unable to open the left camera (CAM{self.left_camera_num}): {exc}")
             self.release()
             return False
 
-        self.right_capture = cv2.VideoCapture(
-            right_pipeline,
-            cv2.CAP_GSTREAMER,
-        )
-
-        if not self.right_capture.isOpened():
-            print("Unable to open the right camera.")
-            print("Pipeline:", right_pipeline)
+        try:
+            self._right_cam = Picamera2(camera_num=self.right_camera_num)
+            right_config = self._make_config(self._right_cam)
+            self._right_cam.configure(right_config)
+            self._right_cam.start()
+        except Exception as exc:
+            print(f"Unable to open the right camera (CAM{self.right_camera_num}): {exc}")
             self.release()
             return False
 
-        # Read a few startup frames because Argus may need time to stabilize
-        # auto-exposure and auto-white-balance.
+        # Warm up: discard a few startup frames so AE/AWB can stabilise.
         for _ in range(5):
             if not self._capture_pair():
                 print("Unable to read initial stereo frames.")
@@ -118,10 +197,8 @@ class StereoCamera:
 
     def is_opened(self) -> bool:
         return (
-            self.left_capture is not None
-            and self.right_capture is not None
-            and self.left_capture.isOpened()
-            and self.right_capture.isOpened()
+            self._left_cam is not None
+            and self._right_cam is not None
         )
 
     def start(self) -> bool:
@@ -151,26 +228,14 @@ class StereoCamera:
         if not self.is_opened():
             return False
 
-        # Ask both pipelines to advance to their next available frame before
-        # decoding/copying either image.
-        left_grabbed = self.left_capture.grab()
-        right_grabbed = self.right_capture.grab()
-
-        if not left_grabbed or not right_grabbed:
+        try:
+            left_frame, left_timestamp = self._grab_frame(self._left_cam)
+            right_frame, right_timestamp = self._grab_frame(self._right_cam)
+        except Exception as exc:
+            print(f"Frame capture error: {exc}")
             return False
 
-        left_ok, left_frame = self.left_capture.retrieve()
-        left_timestamp = time.monotonic_ns() / 1_000_000_000.0
-
-        right_ok, right_frame = self.right_capture.retrieve()
-        right_timestamp = time.monotonic_ns() / 1_000_000_000.0
-
-        if (
-            not left_ok
-            or not right_ok
-            or left_frame is None
-            or right_frame is None
-        ):
+        if left_frame is None or right_frame is None:
             return False
 
         delta_ms = abs(right_timestamp - left_timestamp) * 1000.0
@@ -241,13 +306,21 @@ class StereoCamera:
     def release(self) -> None:
         self.stop()
 
-        if self.left_capture is not None:
-            self.left_capture.release()
-            self.left_capture = None
+        if self._left_cam is not None:
+            try:
+                self._left_cam.stop()
+                self._left_cam.close()
+            except Exception:
+                pass
+            self._left_cam = None
 
-        if self.right_capture is not None:
-            self.right_capture.release()
-            self.right_capture = None
+        if self._right_cam is not None:
+            try:
+                self._right_cam.stop()
+                self._right_cam.close()
+            except Exception:
+                pass
+            self._right_cam = None
 
         with self._frame_lock:
             self._latest_frame = None

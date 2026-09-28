@@ -1,8 +1,8 @@
 """
 stereo_calibration_capture.py
 
-Capture stereo chessboard image pairs from two IMX219 CSI cameras
-on a Jetson device.
+Capture stereo chessboard image pairs from two CSI cameras
+on a Raspberry Pi 5 using picamera2.
 
 Controls:
     SPACE or S : Save the current stereo pair
@@ -24,13 +24,23 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    raise ImportError(
+        "picamera2 is not installed. Install it with:\n"
+        "  sudo apt install python3-picamera2\n"
+        "or:\n"
+        "  pip install picamera2"
+    )
+
 
 class Camera:
-    """Threaded CSI camera reader for NVIDIA Jetson."""
+    """Threaded CSI camera reader for Raspberry Pi 5 using picamera2."""
 
     def __init__(self, name: str = "camera") -> None:
         self.name = name
-        self.video_capture: cv2.VideoCapture | None = None
+        self._picam: Picamera2 | None = None
 
         self.frame: np.ndarray | None = None
         self.grabbed = False
@@ -41,99 +51,102 @@ class Camera:
         self.read_lock = threading.Lock()
         self.running = False
 
-    @staticmethod
-    def create_gstreamer_pipeline(
-        sensor_id: int,
-        sensor_mode: int = 2,
-        capture_width: int = 960,
-        capture_height: int = 540,
-        output_width: int = 960,
-        output_height: int = 540,
-        framerate: int = 30,
-        flip_method: int = 0,
-    ) -> str:
-        """
-        Build a GStreamer pipeline for an IMX219 CSI camera.
-
-        Calibration must later use the same output_width/output_height,
-        crop, sensor mode, and flip method.
-        """
-
-        return (
-            f"nvarguscamerasrc sensor-id={sensor_id} "
-            f"sensor-mode={sensor_mode} ! "
-            "video/x-raw(memory:NVMM), "
-            f"width=(int){capture_width}, "
-            f"height=(int){capture_height}, "
-            f"framerate=(fraction){framerate}/1, "
-            "format=(string)NV12 ! "
-            f"nvvidconv flip-method={flip_method} ! "
-            "video/x-raw, "
-            f"width=(int){output_width}, "
-            f"height=(int){output_height}, "
-            "format=(string)BGRx ! "
-            "videoconvert ! "
-            "video/x-raw, format=(string)BGR ! "
-            "appsink drop=true max-buffers=1 sync=false"
-        )
-
     def open(
         self,
         sensor_id: int,
-        sensor_mode: int = 2,
+        # The parameters below are kept for API compatibility with the
+        # Jetson version but have different semantics on the Pi:
+        sensor_mode: int = 2,         # unused – picamera2 uses sensor modes differently
         capture_width: int = 1920,
         capture_height: int = 1080,
         output_width: int = 960,
         output_height: int = 540,
         framerate: int = 30,
-        flip_method: int = 2,
+        flip_method: int = 0,
     ) -> None:
-        if self.video_capture is not None:
+        if self._picam is not None:
             self.release()
 
-        pipeline = self.create_gstreamer_pipeline(
-            sensor_id=sensor_id,
-            sensor_mode=sensor_mode,
-            capture_width=capture_width,
-            capture_height=capture_height,
-            output_width=output_width,
-            output_height=output_height,
-            framerate=framerate,
-            flip_method=flip_method,
-        )
+        self._output_width = output_width
+        self._output_height = output_height
+        self._flip_method = flip_method
 
-        print(f"{self.name} pipeline:\n{pipeline}\n")
+        print(f"{self.name}: opening CAM{sensor_id} "
+              f"@ {capture_width}x{capture_height} → "
+              f"{output_width}x{output_height}, {framerate} fps")
 
-        self.video_capture = cv2.VideoCapture(
-            pipeline,
-            cv2.CAP_GSTREAMER,
-        )
-
-        if not self.video_capture.isOpened():
-            self.video_capture.release()
-            self.video_capture = None
+        try:
+            self._picam = Picamera2(camera_num=sensor_id)
+            config = self._picam.create_video_configuration(
+                main={
+                    "size": (capture_width, capture_height),
+                    "format": "BGR888",
+                },
+                controls={"FrameRate": float(framerate)},
+                buffer_count=4,
+            )
+            self._picam.configure(config)
+            self._picam.start()
+        except Exception as exc:
+            if self._picam is not None:
+                try:
+                    self._picam.close()
+                except Exception:
+                    pass
+                self._picam = None
             raise RuntimeError(
-                f"Could not open {self.name}, sensor-id={sensor_id}"
+                f"Could not open {self.name}, sensor-id={sensor_id}: {exc}"
             )
 
         # Read an initial frame before starting the thread.
-        grabbed, frame = self.video_capture.read()
-
-        if not grabbed or frame is None:
-            self.video_capture.release()
-            self.video_capture = None
+        try:
+            raw = self._picam.capture_array("main")
+        except Exception as exc:
+            self._picam.close()
+            self._picam = None
             raise RuntimeError(
-                f"{self.name} opened but did not return an initial frame."
+                f"{self.name} opened but did not return an initial frame: {exc}"
             )
 
+        frame = self._process_frame(raw)
+
         with self.read_lock:
-            self.grabbed = grabbed
+            self.grabbed = True
             self.frame = frame
             self.frame_id = 1
             self.timestamp_ns = time.monotonic_ns()
 
+    def _process_frame(self, raw: np.ndarray) -> np.ndarray:
+        """Apply flip and output resize."""
+        frame = np.ascontiguousarray(raw)
+
+        flip = self._flip_method
+        if flip == 1:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif flip == 2:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif flip == 3:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif flip == 4:
+            frame = cv2.flip(frame, 1)
+        elif flip == 5:
+            frame = cv2.transpose(frame)
+        elif flip == 6:
+            frame = cv2.flip(frame, 0)
+        elif flip == 7:
+            frame = cv2.flip(cv2.transpose(frame), 1)
+
+        h, w = frame.shape[:2]
+        if w != self._output_width or h != self._output_height:
+            frame = cv2.resize(
+                frame,
+                (self._output_width, self._output_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        return frame
+
     def start(self) -> None:
-        if self.video_capture is None:
+        if self._picam is None:
             raise RuntimeError(f"{self.name} must be opened before start().")
 
         if self.running:
@@ -149,16 +162,17 @@ class Camera:
 
     def _read_loop(self) -> None:
         while self.running:
-            if self.video_capture is None:
+            if self._picam is None:
                 break
 
-            grabbed, frame = self.video_capture.read()
-            timestamp_ns = time.monotonic_ns()
-
-            if not grabbed or frame is None:
-                # Avoid a busy loop if the camera temporarily fails.
+            try:
+                raw = self._picam.capture_array("main")
+                timestamp_ns = time.monotonic_ns()
+            except Exception:
                 time.sleep(0.005)
                 continue
+
+            frame = self._process_frame(raw)
 
             with self.read_lock:
                 self.grabbed = True
@@ -171,7 +185,6 @@ class Camera:
         Return:
             success, copied frame, frame ID, timestamp in nanoseconds
         """
-
         with self.read_lock:
             if not self.grabbed or self.frame is None:
                 return False, None, self.frame_id, self.timestamp_ns
@@ -193,9 +206,13 @@ class Camera:
     def release(self) -> None:
         self.stop()
 
-        if self.video_capture is not None:
-            self.video_capture.release()
-            self.video_capture = None
+        if self._picam is not None:
+            try:
+                self._picam.stop()
+                self._picam.close()
+            except Exception:
+                pass
+            self._picam = None
 
         with self.read_lock:
             self.frame = None
@@ -611,19 +628,23 @@ def parse_board_size(value: str) -> tuple[int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Capture stereo chessboard calibration images."
+        description="Capture stereo chessboard calibration images (Raspberry Pi 5 / picamera2)."
     )
 
-    parser.add_argument("--left-sensor", type=int, default=0)
-    parser.add_argument("--right-sensor", type=int, default=1)
-    parser.add_argument("--sensor-mode", type=int, default=2)
+    parser.add_argument("--left-sensor", type=int, default=0,
+                        help="Camera number for the left camera (CAM port index, default: 0)")
+    parser.add_argument("--right-sensor", type=int, default=1,
+                        help="Camera number for the right camera (CAM port index, default: 1)")
+    parser.add_argument("--sensor-mode", type=int, default=2,
+                        help="Sensor mode (informational only, not used by picamera2 directly)")
 
     parser.add_argument("--capture-width", type=int, default=1920)
     parser.add_argument("--capture-height", type=int, default=1080)
     parser.add_argument("--output-width", type=int, default=960)
     parser.add_argument("--output-height", type=int, default=540)
     parser.add_argument("--framerate", type=int, default=30)
-    parser.add_argument("--flip-method", type=int, default=2)
+    parser.add_argument("--flip-method", type=int, default=0,
+                        help="0=none, 2=180°, 4=hflip, 6=vflip (same convention as nvvidconv)")
 
     parser.add_argument(
         "--board-size",
