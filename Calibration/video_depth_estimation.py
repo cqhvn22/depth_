@@ -56,7 +56,7 @@ class StereoDepth:
         self._video_w: int | None = None  # set on first process() call
         self._video_h: int | None = None
 
-        print(f"Calibration map size : {self._calib_w}×{self._calib_h}")
+        print(f"Calibration map size : {self._calib_w}x{self._calib_h}")
 
         self.downscale = downscale
 
@@ -93,7 +93,7 @@ class StereoDepth:
         If the input frames differ from the calibration resolution (including
         a different aspect ratio), they are resized to the calibration size
         before remapping. This is the only geometrically correct approach when
-        the aspect ratios do not match (e.g. 640×480 video vs 960×540 calib).
+        the aspect ratios do not match (e.g. 640x480 video vs 960x540 calib).
 
         Returns:
             left_rectified  – BGR image at calibration resolution
@@ -107,18 +107,18 @@ class StereoDepth:
         if w != self._calib_w or h != self._calib_h:
             if self._video_w != w or self._video_h != h:
                 # Log once per unique video resolution
-                print(f"Video size           : {w}×{h}")
-                print(f"Calibration size     : {self._calib_w}×{self._calib_h}")
+                print(f"Video size           : {w}x{h}")
+                print(f"Calibration size     : {self._calib_w}x{self._calib_h}")
                 if abs(w / h - self._calib_w / self._calib_h) > 0.01:
                     print("WARNING: Different aspect ratios detected "
                           f"({w/h:.3f} vs {self._calib_w/self._calib_h:.3f}). "
                           "Frames will be stretched to calibration resolution.\n"
                           "For accurate depth, re-record videos at "
-                          f"{self._calib_w}×{self._calib_h} or re-calibrate at "
-                          f"{w}×{h}.\n")
+                          f"{self._calib_w}x{self._calib_h} or re-calibrate at "
+                          f"{w}x{h}.\n")
                 else:
-                    print(f"Resizing frames {w}×{h} → "
-                          f"{self._calib_w}×{self._calib_h} (same aspect ratio).\n")
+                    print(f"Resizing frames {w}x{h} -> "
+                          f"{self._calib_w}x{self._calib_h} (same aspect ratio).\n")
                 self._video_w = w
                 self._video_h = h
 
@@ -212,7 +212,7 @@ def depth_to_color(depth: np.ndarray,
 
 def get_center_depth(depth: np.ndarray,
                      calibration_unit: str = "mm") -> float | None:
-    """Median depth in a 11×11 region around the image centre."""
+    """Median depth in a 11x11 region around the image centre."""
     h, w = depth.shape
     cx, cy = w // 2, h // 2
     region = depth[cy - 5 : cy + 6, cx - 5 : cx + 6]
@@ -319,7 +319,7 @@ def main() -> None:
                         help="Path to stereo_calibration.npz (default: stereo_calibration.npz)")
     parser.add_argument("--downscale", type=float, default=0.5,
                         help="Downscale factor for disparity computation (default: 0.5). "
-                             "Lower → faster, higher → more detail.")
+                             "Lower -> faster, higher -> more detail.")
     parser.add_argument("--calibration-unit", default="mm",
                         choices=["mm", "cm", "m"],
                         help="Unit used during calibration (default: mm)")
@@ -356,7 +356,7 @@ def main() -> None:
 
     print(f"Left  video : {left_path}")
     print(f"Right video : {right_path}")
-    print(f"Resolution  : {frame_width}×{frame_height}  FPS: {src_fps:.1f}")
+    print(f"Resolution  : {frame_width}x{frame_height}  FPS: {src_fps:.1f}")
     print(f"Total frames: {total_frames}")
 
     # ------------------------------------------------------------------
@@ -378,7 +378,7 @@ def main() -> None:
         out_w = frame_width * 2
         out_h = frame_height
         writer = make_video_writer(args.save_video, out_w, out_h, src_fps)
-        print(f"Saving output to: {args.save_video}  ({out_w}×{out_h} @ {src_fps} fps)\n")
+        print(f"Saving output to: {args.save_video}  ({out_w}x{out_h} @ {src_fps} fps)\n")
 
     # ------------------------------------------------------------------
     # Playback state
@@ -492,7 +492,7 @@ def main() -> None:
                 cv2.imwrite(str(snapshot_dir / f"{tag}_disparity.png"), disp_color)
                 cv2.imwrite(str(snapshot_dir / f"{tag}_depth.png"),     depth_color)
                 np.save(str(snapshot_dir / f"{tag}_depth_raw.npy"), depth)
-                print(f"  → Snapshot saved to {snapshot_dir}/{tag}_*.png")
+                print(f"  -> Snapshot saved to {snapshot_dir}/{tag}_*.png")
                 save_snapshot = False
 
             # ----------------------------------------------------------
@@ -509,25 +509,25 @@ def main() -> None:
         # ------------------------------------------------------------------
         key = cv2.waitKey(delay_ms) & 0xFF
 
-        if key in (ord("q"), 27):          # Q / ESC → quit
+        if key in (ord("q"), 27):          # Q / ESC -> quit
             break
 
-        elif key == ord(" "):              # SPACE → pause/resume
+        elif key == ord(" "):              # SPACE -> pause/resume
             paused = not paused
             print("Paused." if paused else "Resumed.")
 
-        elif key == ord("s"):              # S → snapshot
+        elif key == ord("s"):              # S -> snapshot
             save_snapshot = True
 
-        elif key == ord("]"):              # ] → faster
+        elif key == ord("]"):              # ] -> faster
             speed = min(speed * 2.0, 16.0)
-            print(f"Speed: {speed:.2f}×")
+            print(f"Speed: {speed:.2f}x")
 
-        elif key == ord("["):              # [ → slower
+        elif key == ord("["):              # [ -> slower
             speed = max(speed / 2.0, 0.125)
-            print(f"Speed: {speed:.2f}×")
+            print(f"Speed: {speed:.2f}x")
 
-        elif key == ord("r"):              # R → restart
+        elif key == ord("r"):              # R -> restart
             cap_l.set(cv2.CAP_PROP_POS_FRAMES, 0)
             cap_r.set(cv2.CAP_PROP_POS_FRAMES, 0)
             frame_idx = 0
