@@ -77,6 +77,20 @@ class StereoDepth:
             mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
         )
 
+        if not hasattr(cv2, "ximgproc"):
+            raise RuntimeError(
+                "cv2.ximgproc is required for stereo WLS filtering. "
+                "Install the OpenCV contrib package with: "
+                "pip install opencv-contrib-python"
+            )
+
+        if not hasattr(cv2.ximgproc, "createRightMatcher"):
+            raise RuntimeError(
+                "This OpenCV build is missing the ximgproc stereo helpers "
+                "(createRightMatcher / createDisparityWLSFilter). "
+                "Install opencv-contrib-python and re-run the script."
+            )
+
         self.right_matcher = cv2.ximgproc.createRightMatcher(self.matcher)
         self.wls_filter    = cv2.ximgproc.createDisparityWLSFilter(
             matcher_left=self.matcher
@@ -306,16 +320,45 @@ def make_video_writer(
 # Main
 # ---------------------------------------------------------------------------
 
+def resolve_input_path(path_value: str, *, default_name: str | None = None) -> str:
+    """Resolve relative file paths from the current working directory or the
+    script directory. This keeps the defaults working when the tool is launched
+    from anywhere in the repository.
+    """
+    candidate = Path(path_value).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+
+    search_roots = [
+        Path.cwd(),
+        Path(__file__).resolve().parent,
+        Path(__file__).resolve().parent / "recordings",
+    ]
+
+    for root in search_roots:
+        resolved = (root / candidate).resolve()
+        if resolved.exists():
+            return str(resolved)
+
+    if default_name is not None:
+        fallback = (Path(__file__).resolve().parent / default_name).resolve()
+        if fallback.exists():
+            return str(fallback)
+
+    return str(candidate)
+
+
 def main() -> None:
+    script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description="Stereo depth estimation from recorded left/right video files."
     )
-    parser.add_argument("--left",  required=True,
+    parser.add_argument("--left", default=str(script_dir / "left_20260928_134412.mp4"),
                         help="Path to the left video file")
-    parser.add_argument("--right", required=True,
+    parser.add_argument("--right", default=str(script_dir / "right_20260928_134412.mp4"),
                         help="Path to the right video file")
     parser.add_argument("--calib",
-                        default="stereo_calibration.npz",
+                        default=str(script_dir / "stereo_calibration.npz"),
                         help="Path to stereo_calibration.npz (default: stereo_calibration.npz)")
     parser.add_argument("--downscale", type=float, default=0.5,
                         help="Downscale factor for disparity computation (default: 0.5). "
@@ -337,8 +380,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Open video captures
     # ------------------------------------------------------------------
-    left_path  = args.left
-    right_path = args.right
+    left_path  = resolve_input_path(args.left)
+    right_path = resolve_input_path(args.right)
+    calib_path = resolve_input_path(args.calib)
 
     cap_l = cv2.VideoCapture(left_path)
     cap_r = cv2.VideoCapture(right_path)
@@ -362,11 +406,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Load calibration + build depth estimator
     # ------------------------------------------------------------------
-    if not Path(args.calib).exists():
-        sys.exit(f"[ERROR] Calibration file not found: {args.calib}")
+    if not Path(calib_path).exists():
+        sys.exit(f"[ERROR] Calibration file not found: {calib_path}")
 
-    print(f"\nLoading calibration from: {args.calib}")
-    depth_estimator = StereoDepth(args.calib, downscale=args.downscale)
+    print(f"\nLoading calibration from: {calib_path}")
+    depth_estimator = StereoDepth(calib_path, downscale=args.downscale)
     print("Calibration loaded.\n")
 
     # ------------------------------------------------------------------
