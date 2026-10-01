@@ -16,15 +16,23 @@ class StereoDepth:
 
         block_size = 7
 
-        # Z_min = (focal_px × baseline_m) / numDisparities_effective
-        # numDisparities_effective = num_disp / downscale
-        # Tăng num_disp → đo được gần hơn, nhưng chậm hơn.
+        # TRADE-OFF: numDisparities vs. vùng ảnh hợp lệ
+        # ---------------------------------------------------------------
+        # Stereo matching chỉ hợp lệ từ cột numDisparities_eff trở đi
+        # (cột trái của ảnh không có điểm tương ứng trong ảnh phải).
+        #
+        # downscale=0.5 → numDisparities_eff = num_disp / 0.5 (full-res)
+        # Ảnh rộng 960 px:
+        #
+        #  num_disp | strip mất (full-res) | % FOV mất | Z_min ≈
+        #  ---------|----------------------|-----------|----------
+        #    96     |  192 px              |   20 %    | 0.40 m   ← tầm xa, FOV tốt
+        #   128     |  256 px              |   27 %    | 0.30 m   ← cân bằng ✓
+        #   160     |  320 px              |   33 %    | 0.24 m
+        #   208     |  416 px              |   43 %    | 0.18 m   ← tầm gần, mất nửa ảnh
+        #
         # Phải là bội số của 16.
-        # downscale=0.5 → effective = num_disp / 0.5
-        #   96  → effective 192 px → Z_min ≈ 0.40 m
-        #   160 → effective 320 px → Z_min ≈ 0.24 m
-        #   208 → effective 416 px → Z_min ≈ 0.18 m
-        num_disp = 160 if downscale >= 1.0 else 208
+        num_disp = 128 if downscale >= 1.0 else 128
 
         self.matcher = cv2.StereoSGBM_create(
             minDisparity=0,
