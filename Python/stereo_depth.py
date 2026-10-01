@@ -15,24 +15,7 @@ class StereoDepth:
         self.downscale = downscale
 
         block_size = 7
-
-        # TRADE-OFF: numDisparities vs. vùng ảnh hợp lệ
-        # ---------------------------------------------------------------
-        # Stereo matching chỉ hợp lệ từ cột numDisparities_eff trở đi
-        # (cột trái của ảnh không có điểm tương ứng trong ảnh phải).
-        #
-        # downscale=0.5 → numDisparities_eff = num_disp / 0.5 (full-res)
-        # Ảnh rộng 960 px:
-        #
-        #  num_disp | strip mất (full-res) | % FOV mất | Z_min ≈
-        #  ---------|----------------------|-----------|----------
-        #    96     |  192 px              |   20 %    | 0.40 m   ← tầm xa, FOV tốt
-        #   128     |  256 px              |   27 %    | 0.30 m   ← cân bằng ✓
-        #   160     |  320 px              |   33 %    | 0.24 m
-        #   208     |  416 px              |   43 %    | 0.18 m   ← tầm gần, mất nửa ảnh
-        #
-        # Phải là bội số của 16.
-        num_disp = 128 if downscale >= 1.0 else 128
+        num_disp = 128 if downscale >= 1.0 else 96  # can drop further if needed
 
         self.matcher = cv2.StereoSGBM_create(
             minDisparity=0,

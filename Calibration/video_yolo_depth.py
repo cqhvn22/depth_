@@ -1,72 +1,102 @@
 """
 video_yolo_depth.py
+===================
 
-YOLOv8n-seg object segmentation integrated with stereo depth estimation on
-pre-recorded left/right video files.
+YOLO (best.pt) + stereo depth – luồng stream trực tiếp từ 2 camera.
 
-For every detected object the pipeline reports:
-  - Distance  : robust median depth inside the segmentation mask (metres)
-  - Physical width  : estimated from pixel width  * depth / focal-length
-  - Physical height : estimated from pixel height * depth / focal-length
+Pipeline:
+  • Live preview: nhận frame liên tục, chạy YOLO + depth, hiển thị kết quả
+    trực quan theo thời gian thực.
+  • Khi bấm T: chụp liên tiếp 10 khung hình, tổng hợp kết quả bằng TRUNG VỊ,
+    rồi hiển thị bảng thông số chi tiết. Có thể bấm T nhiều lần.
 
-Physical-size formula (thin-lens / pinhole model):
-    W_real = (box_w_px * Z) / f_px
-    H_real = (box_h_px * Z) / f_px
+Thông số mỗi detection:
+    - Tên lớp + confidence
+    - Khoảng cách đến vật (m)
+    - Kích thước vật (rộng × cao, cm hoặc m)
+    - Tọa độ tâm vật trong ảnh (px)
+    - Thông tin burst: N frame, median vs mean
 
-where Z is the median depth in the mask ROI and f_px is the focal length
-extracted from the Q reprojection matrix (Q[2, 3]).
+Controls:
+    T        – Trigger burst 10 frame → phân tích + hiển thị chi tiết
+    Q / ESC  – Thoát
+    D        – Bật / Tắt cửa sổ depth map
+    R        – Reset về live preview
+    S        – Lưu snapshot kết quả hiện tại
+    +/-      – Tăng / Giảm confidence threshold (±0.05)
 
-Requires a YOLO segmentation model (e.g. yolov8n-seg.pt) to draw true
-object outlines. Falls back to bounding-box rectangles if no mask is
-available.
-
-Usage:
-    python video_yolo_depth.py \\
-        --left  recordings/left_20260930_164731.mp4 \\
-        --right recordings/right_20260930_164731.mp4 \\
-        --calib stereo_calibration.npz
-
-    # Save output:
-    python video_yolo_depth.py --left L.mp4 --right R.mp4 \\
-        --calib stereo_calibration.npz --save-video output.mp4
-
-Controls (preview window):
-    Q / ESC  : Quit
-    SPACE    : Pause / Resume
-    S        : Save snapshot of current frame set
-    [ / ]    : Decrease / Increase playback speed
-    R        : Restart from the beginning
-    D        : Toggle depth-map window
-    T        : Cycle confidence threshold  (0.25 -> 0.35 -> 0.50 -> 0.25)
+Chạy:
+    python video_yolo_depth.py
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
-# Re-use the StereoDepth class from the existing pipeline
-sys.path.insert(0, str(Path(__file__).parent))
+# ---------------------------------------------------------------------------
+# Thêm thư mục Calibration vào sys.path để import StereoDepth
+# ---------------------------------------------------------------------------
+_CALIB_DIR = Path(__file__).resolve().parent
+if str(_CALIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_CALIB_DIR))
+
+_PYTHON_DIR = _CALIB_DIR.parent / "Python"
+if str(_PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_DIR))
+
 from video_depth_estimation import (
     StereoDepth,
     disparity_to_color,
     depth_to_color,
 )
 
+try:
+    from ultralytics import YOLO
+except ImportError:
+    sys.exit("[ERROR] ultralytics chưa được cài. Chạy: pip install ultralytics")
 
-# ---------------------------------------------------------------------------
-# Colour palette – one colour per COCO class id (80 classes)
-# ---------------------------------------------------------------------------
+try:
+    from camera import StereoCamera
+except ImportError:
+    sys.exit("[ERROR] Không tìm thấy camera.py trong thư mục Python/")
+
+
+# ===========================================================================
+#  C O N F I G
+# ===========================================================================
+
+CALIB_FILE: str = str(_CALIB_DIR / "stereo_calibration.npz")
+MODEL_FILE:  str = str(_CALIB_DIR / "best.pt")
+SNAPSHOT_DIR: str = "yolo_depth_snapshots"
+
+LEFT_CAM_NUM:   int   = 0
+RIGHT_CAM_NUM:  int   = 1
+CAPTURE_WIDTH:  int   = 960
+CAPTURE_HEIGHT: int   = 540
+FRAMERATE:      int   = 30
+
+DEPTH_DOWNSCALE: float = 0.5
+CALIB_UNIT:      str   = "mm"
+MAX_DEPTH_M:     float = 5.0
+
+N_BURST: int   = 10      # số frame mỗi lần bấm T
+CONF_INIT: float = 0.35  # confidence ban đầu
+
+
+# ===========================================================================
+#  Màu sắc
+# ===========================================================================
+
 _RNG = np.random.default_rng(42)
 _CLASS_COLOURS: list[tuple[int, int, int]] = [
     tuple(int(c) for c in _RNG.integers(80, 230, 3))
-    for _ in range(80)
+    for _ in range(200)
 ]
 
 
@@ -74,20 +104,12 @@ def class_colour(class_id: int) -> tuple[int, int, int]:
     return _CLASS_COLOURS[int(class_id) % len(_CLASS_COLOURS)]
 
 
-# ---------------------------------------------------------------------------
-# Physical-size estimation
-# ---------------------------------------------------------------------------
+# ===========================================================================
+#  Tiện ích vật lý
+# ===========================================================================
 
 def focal_length_from_Q(Q: np.ndarray) -> float:
-    """Extract pixel focal length from the 4x4 Q reprojection matrix.
-
-    Standard Q layout (cv2.stereoRectify):
-        [[1,  0,   0,  -cx ],
-         [0,  1,   0,  -cy ],
-         [0,  0,   0,   f  ],
-         [0,  0, -1/Tx, dX ]]
-    So Q[2, 3] == f  (focal length in pixels, at calibration resolution).
-    """
+    """Focal length (px) từ ma trận Q của stereoRectify."""
     return float(Q[2, 3])
 
 
@@ -96,35 +118,28 @@ def box_physical_size(
     x1: int, y1: int, x2: int, y2: int,
     focal_px: float,
     calib_unit: str = "mm",
-) -> tuple[float | None, float | None, float | None]:
-    """Return (distance_m, width_m, height_m) for the bounding box.
-
-    - distance : robust median of valid depths inside the box
-    - width_m  : physical width  at that distance
-    - height_m : physical height at that distance
-
-    Returns (None, None, None) when no valid depth is available.
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """
-    # Clamp to image bounds
+    Tính (khoảng cách m, chiều rộng m, chiều cao m) từ bounding box.
+    Dùng IQR-median để lọc noise.
+    """
     h_img, w_img = depth_map.shape[:2]
-    x1c = max(0, x1);  y1c = max(0, y1)
-    x2c = min(w_img - 1, x2);  y2c = min(h_img - 1, y2)
+    x1c = max(0, x1);   y1c = max(0, y1)
+    x2c = min(w_img-1, x2);  y2c = min(h_img-1, y2)
 
-    roi = depth_map[y1c:y2c, x1c:x2c]
+    roi   = depth_map[y1c:y2c, x1c:x2c]
     valid = roi[np.isfinite(roi) & (roi > 0)]
 
-    if valid.size < 5:          # too few valid pixels
+    if valid.size < 5:
         return None, None, None
 
-    # Use the 25th–75th percentile median to exclude background leakage
     lo, hi = np.percentile(valid, 25), np.percentile(valid, 75)
-    core = valid[(valid >= lo) & (valid <= hi)]
+    core   = valid[(valid >= lo) & (valid <= hi)]
     if core.size == 0:
         core = valid
 
-    depth_raw = float(np.median(core))   # in calibration unit
+    depth_raw = float(np.median(core))
 
-    # Convert to metres
     if calib_unit == "mm":
         depth_m = depth_raw / 1000.0
     elif calib_unit == "cm":
@@ -135,62 +150,47 @@ def box_physical_size(
     if depth_m <= 0 or not np.isfinite(depth_m):
         return None, None, None
 
-    box_w_px = x2c - x1c
-    box_h_px = y2c - y1c
-
     if focal_px <= 0:
         return depth_m, None, None
 
-    width_m  = (box_w_px * depth_m) / focal_px
-    height_m = (box_h_px * depth_m) / focal_px
+    width_m  = ((x2c - x1c) * depth_m) / focal_px
+    height_m = ((y2c - y1c) * depth_m) / focal_px
 
     return depth_m, width_m, height_m
 
 
-# ---------------------------------------------------------------------------
-# Overlay helpers
-# ---------------------------------------------------------------------------
+def fmt_m(v: Optional[float]) -> str:
+    if v is None:
+        return "N/A"
+    if v < 1.0:
+        return f"{v * 100:.1f} cm"
+    return f"{v:.3f} m"
 
-# Confidence threshold cycle values
-_CONF_CYCLE = [0.25, 0.35, 0.50]
 
+# ===========================================================================
+#  Vẽ overlay
+# ===========================================================================
 
 def draw_detection(
     img: np.ndarray,
     x1: int, y1: int, x2: int, y2: int,
     label: str,
-    distance_m: float | None,
-    width_m: float | None,
-    height_m: float | None,
+    dist_m: Optional[float],
+    width_m: Optional[float],
+    height_m: Optional[float],
     colour: tuple[int, int, int],
-    depth_map: np.ndarray,
-    mask_polygon: np.ndarray | None = None,
+    mask_polygon: Optional[np.ndarray] = None,
 ) -> None:
-    """Draw a single detection with true object contour (mask) overlay.
-
-    If ``mask_polygon`` is provided (Nx2 int32 array of pixel coordinates),
-    the object's actual shape is rendered with a semi-transparent fill and
-    a solid outline.  Otherwise a plain bounding-box rectangle is used as
-    fallback.
-    """
     overlay = img.copy()
     alpha   = 0.25
 
     if mask_polygon is not None and len(mask_polygon) >= 3:
         pts = mask_polygon.reshape((-1, 1, 2)).astype(np.int32)
-
-        # ---- Semi-transparent mask fill ----
         cv2.fillPoly(overlay, [pts], colour)
         cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
-
-        # ---- Solid outline (2-px glow + 1-px sharp) ----
-        cv2.polylines(img, [pts], isClosed=True, color=colour, thickness=3,
-                      lineType=cv2.LINE_AA)
+        cv2.polylines(img, [pts], True, colour, 3, cv2.LINE_AA)
         bright = tuple(min(255, int(c * 1.5)) for c in colour)
-        cv2.polylines(img, [pts], isClosed=True, color=bright, thickness=1,
-                      lineType=cv2.LINE_AA)
-
-        # Centre from mask centroid
+        cv2.polylines(img, [pts], True, bright, 1, cv2.LINE_AA)
         M = cv2.moments(pts)
         if M["m00"] != 0:
             cx = int(M["m10"] / M["m00"])
@@ -198,416 +198,483 @@ def draw_detection(
         else:
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     else:
-        # ---- Fallback: bounding-box rectangle ----
         cv2.rectangle(overlay, (x1, y1), (x2, y2), colour, -1)
         cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
         cv2.rectangle(img, (x1, y1), (x2, y2), colour, 2)
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-    # ---- Distance cross-hair at the object centre ----
+    # Crosshair
     arm = 12
     cv2.line(img, (cx - arm, cy), (cx + arm, cy), (0, 255, 0), 2)
     cv2.line(img, (cx, cy - arm), (cx, cy + arm), (0, 255, 0), 2)
     cv2.circle(img, (cx, cy), 4, (0, 255, 0), -1)
 
-    # ---- Build label lines ----
+    # Label
     lines: list[str] = [label]
-    if distance_m is not None:
-        lines.append(f"Dist : {distance_m:.2f} m")
-    else:
-        lines.append("Dist : N/A")
-
+    lines.append(f"Dist : {fmt_m(dist_m)}")
     if width_m is not None and height_m is not None:
-        # Choose cm for small objects, m for large
-        if max(width_m, height_m) < 1.0:
-            lines.append(f"Size : {width_m * 100:.1f} x {height_m * 100:.1f} cm")
-        else:
-            lines.append(f"Size : {width_m:.2f} x {height_m:.2f} m")
+        lines.append(f"Size : {fmt_m(width_m)} x {fmt_m(height_m)}")
     else:
         lines.append("Size : N/A")
 
-    # ---- Draw label background + text ----
-    font       = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.52
-    thickness  = 1
-    pad        = 4
-    line_h     = 18
+    font   = cv2.FONT_HERSHEY_SIMPLEX
+    fscale = 0.50
+    thick  = 1
+    pad    = 4
+    lh     = 18
 
-    text_w = max(
-        cv2.getTextSize(ln, font, font_scale, thickness)[0][0]
-        for ln in lines
-    )
-    text_h_total = line_h * len(lines) + pad
+    tw = max(cv2.getTextSize(ln, font, fscale, thick)[0][0] for ln in lines)
+    th = lh * len(lines) + pad
 
-    # Try to place label above the box; fall back to inside
-    label_y0 = y1 - text_h_total - pad
-    if label_y0 < 0:
-        label_y0 = y1 + pad
+    ly0 = y1 - th - pad
+    if ly0 < 0:
+        ly0 = y1 + pad
 
-    cv2.rectangle(
-        img,
-        (x1, label_y0),
-        (x1 + text_w + pad * 2, label_y0 + text_h_total),
-        colour, -1,
-    )
+    cv2.rectangle(img, (x1, ly0), (x1 + tw + pad * 2, ly0 + th),
+                  tuple(max(0, c - 50) for c in colour), -1)
     for i, ln in enumerate(lines):
-        ty = label_y0 + pad + line_h * (i + 1) - 2
+        ty = ly0 + pad + lh * (i + 1) - 2
         cv2.putText(img, ln, (x1 + pad, ty),
-                    font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                    font, fscale, (255, 255, 255), thick, cv2.LINE_AA)
 
 
-def overlay_hud(
+def draw_hud(
     img: np.ndarray,
-    frame_idx: int,
-    total_frames: int,
-    fps_display: float,
+    state: str,
     n_det: int,
-    conf_thresh: float,
-    paused: bool,
-    speed: float,
-) -> np.ndarray:
-    """Draw global HUD (FPS, frame counter, progress bar)."""
-    out = img.copy()
-    h, w = out.shape[:2]
-
-    # Top-left info block
-    info_lines = [
-        f"FPS: {fps_display:.1f}   Speed: {speed:.2f}x",
-        f"Detections: {n_det}   Conf: {conf_thresh:.2f}  (T to cycle)",
-        f"{'[PAUSED]' if paused else ''}",
-    ]
+    fps: float,
+    conf: float,
+) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
-    for i, ln in enumerate(info_lines):
-        cv2.putText(out, ln, (14, 28 + i * 26),
-                    font, 0.65, (200, 255, 200), 2, cv2.LINE_AA)
-        cv2.putText(out, ln, (14, 28 + i * 26),
-                    font, 0.65, (20, 20, 20), 1, cv2.LINE_AA)
-
-    # Bottom progress bar
-    bar_w  = w - 40
-    bar_h  = 10
-    bar_x  = 20
-    bar_y  = h - 20
-    filled = int(bar_w * frame_idx / max(total_frames - 1, 1))
-    cv2.rectangle(out, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60, 60, 60), -1)
-    cv2.rectangle(out, (bar_x, bar_y), (bar_x + filled, bar_y + bar_h), (0, 200, 100), -1)
-    cv2.putText(out, f"{frame_idx}/{total_frames}",
-                (bar_x, bar_y - 6), font, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
-
-    return out
+    lines = [
+        f"State: {state}   FPS: {fps:.1f}",
+        f"Detections: {n_det}   Conf: {conf:.2f}",
+        "T=Burst(10)  Q=Quit  D=Depth  R=Reset  S=Save  +/-=Conf",
+    ]
+    for i, ln in enumerate(lines):
+        cv2.putText(img, ln, (14, 26 + i * 24), font, 0.54, (0, 0, 0),      3, cv2.LINE_AA)
+        cv2.putText(img, ln, (14, 26 + i * 24), font, 0.54, (200, 240, 200), 1, cv2.LINE_AA)
 
 
-# ---------------------------------------------------------------------------
-# Video writer helper
-# ---------------------------------------------------------------------------
+def draw_burst_banner(
+    img: np.ndarray,
+    n_frames: int,
+    n_valid: int,
+    detections_summary: list[dict],
+) -> None:
+    """
+    Vẽ banner kết quả burst ở phía dưới ảnh.
+    detections_summary: list of {name, conf, dist_m, width_m, height_m}
+    """
+    h, w = img.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
 
-def make_video_writer(path: str, width: int, height: int, fps: float) -> cv2.VideoWriter:
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not open VideoWriter for '{path}'")
-    return writer
+    banner_h = 30 + 22 * max(1, len(detections_summary))
+    y0 = h - banner_h
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, y0), (w, h), (20, 20, 50), -1)
+    cv2.addWeighted(overlay, 0.78, img, 0.22, 0, img)
+
+    # Tiêu đề
+    header = (f"[BURST RESULT]  {n_valid}/{n_frames} frames hợp lệ  "
+              f"– Trung vị {n_frames} frames")
+    cv2.putText(img, header, (12, y0 + 20), font, 0.55,
+                (100, 220, 255), 1, cv2.LINE_AA)
+
+    if not detections_summary:
+        cv2.putText(img, "Không phát hiện đối tượng.", (12, y0 + 42),
+                    font, 0.50, (180, 180, 180), 1, cv2.LINE_AA)
+        return
+
+    for i, det in enumerate(detections_summary):
+        ty = y0 + 42 + i * 22
+        colour = class_colour(det.get("cls_id", i))
+        text = (
+            f"  [{i+1}] {det['name']} {det['conf']:.0%}  |  "
+            f"Dist={fmt_m(det['dist_m'])}  |  "
+            f"W={fmt_m(det['width_m'])}  H={fmt_m(det['height_m'])}  |  "
+            f"Cx={det.get('cx_px', 'N/A')}px Cy={det.get('cy_px', 'N/A')}px"
+        )
+        cv2.putText(img, text, (12, ty), font, 0.46,
+                    tuple(min(255, int(c * 1.4)) for c in colour),
+                    1, cv2.LINE_AA)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ===========================================================================
+#  Burst capture
+# ===========================================================================
+
+class BurstResult:
+    __slots__ = [
+        "annotated", "depth_color",
+        "detections_summary", "n_frames", "n_valid",
+    ]
+
+    def __init__(self) -> None:
+        self.annotated:          Optional[np.ndarray] = None
+        self.depth_color:        Optional[np.ndarray] = None
+        self.detections_summary: list[dict]            = []
+        self.n_frames:           int                   = 0
+        self.n_valid:            int                   = 0
+
+
+def run_burst(
+    camera: StereoCamera,
+    depth_est: StereoDepth,
+    yolo: YOLO,
+    focal_px: float,
+    n_burst: int = N_BURST,
+    conf: float  = CONF_INIT,
+) -> BurstResult:
+    """
+    Chụp n_burst frame, chạy YOLO + depth trên từng frame,
+    gom nhóm detection theo cls_id, tổng hợp bằng trung vị.
+    """
+    result   = BurstResult()
+    result.n_frames = n_burst
+
+    # cls_id → lists of (dist, width, height, cx, cy, conf)
+    agg: dict[int, dict] = {}
+
+    last_left_rect:   Optional[np.ndarray] = None
+    last_depth_map:   Optional[np.ndarray] = None
+    last_det_raw:     list[dict]            = []
+
+    last_sequence: Optional[int] = None
+    n_valid = 0
+
+    print(f"\n[BURST] Bắt đầu chụp {n_burst} frame …")
+
+    for frame_i in range(n_burst):
+        # Chờ frame mới
+        ok = False
+        for _ in range(60):
+            ok_, sf = camera.read(last_sequence=last_sequence, copy_frames=True)
+            if ok_ and sf is not None:
+                ok = True
+                last_sequence = sf.sequence
+                left_raw, right_raw = sf.left, sf.right
+                break
+            time.sleep(0.008)
+
+        if not ok:
+            print(f"  [BURST] Frame {frame_i+1}: timeout, bỏ qua.")
+            continue
+
+        n_valid += 1
+        left_rect, _, depth_map = depth_est.process(left_raw, right_raw)
+
+        results = yolo(left_rect, conf=conf, verbose=False)
+        boxes   = results[0].boxes
+        masks   = results[0].masks
+
+        frame_dets: list[dict] = []
+
+        if boxes is not None and len(boxes) > 0:
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
+                cls_id  = int(box.cls[0])
+                conf_v  = float(box.conf[0])
+                name    = yolo.names[cls_id]
+                cx_px   = (x1 + x2) // 2
+                cy_px   = (y1 + y2) // 2
+
+                mask_poly: Optional[np.ndarray] = None
+                if masks is not None and i < len(masks):
+                    xy = masks[i].xy
+                    if xy is not None and len(xy) > 0 and len(xy[0]) >= 3:
+                        mask_poly = xy[0].astype(np.int32)
+
+                dist_m, w_m, h_m = box_physical_size(
+                    depth_map, x1, y1, x2, y2, focal_px, CALIB_UNIT
+                )
+
+                frame_dets.append({
+                    "cls_id": cls_id, "name": name,
+                    "conf": conf_v,
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "cx_px": cx_px, "cy_px": cy_px,
+                    "dist_m": dist_m, "width_m": w_m, "height_m": h_m,
+                    "mask_poly": mask_poly,
+                })
+
+                # Tích luỹ theo cls_id
+                if cls_id not in agg:
+                    agg[cls_id] = {
+                        "name": name,
+                        "confs": [], "dists": [],
+                        "widths": [], "heights": [],
+                        "cxs": [], "cys": [],
+                    }
+                agg[cls_id]["confs"].append(conf_v)
+                if dist_m is not None:
+                    agg[cls_id]["dists"].append(dist_m)
+                if w_m is not None:
+                    agg[cls_id]["widths"].append(w_m)
+                if h_m is not None:
+                    agg[cls_id]["heights"].append(h_m)
+                agg[cls_id]["cxs"].append(cx_px)
+                agg[cls_id]["cys"].append(cy_px)
+
+        last_left_rect = left_rect
+        last_depth_map = depth_map
+        last_det_raw   = frame_dets
+        print(f"  [BURST] Frame {frame_i+1}/{n_burst}: {len(frame_dets)} detection(s)")
+
+    result.n_valid = n_valid
+
+    # ── Tổng hợp bằng trung vị ────────────────────────────────────────
+    summary: list[dict] = []
+    for cls_id, data in agg.items():
+        med_dist  = float(np.median(data["dists"]))   if data["dists"]   else None
+        med_w     = float(np.median(data["widths"]))  if data["widths"]  else None
+        med_h     = float(np.median(data["heights"])) if data["heights"] else None
+        med_conf  = float(np.median(data["confs"]))   if data["confs"]   else 0.0
+        med_cx    = int(np.median(data["cxs"]))       if data["cxs"]     else 0
+        med_cy    = int(np.median(data["cys"]))       if data["cys"]     else 0
+        summary.append({
+            "cls_id": cls_id,
+            "name":   data["name"],
+            "conf":   med_conf,
+            "dist_m":  med_dist,
+            "width_m": med_w,
+            "height_m": med_h,
+            "cx_px": med_cx,
+            "cy_px": med_cy,
+        })
+
+    result.detections_summary = summary
+
+    # Console log chi tiết
+    print(f"\n{'='*62}")
+    print(f"  BURST RESULT  ({n_valid}/{n_burst} frames hợp lệ)")
+    print(f"{'='*62}")
+    if not summary:
+        print("  [!] Không phát hiện đối tượng nào.")
+    for i, det in enumerate(summary):
+        print(f"  [{i+1}] {det['name']:<20s}  conf={det['conf']:.2f}")
+        print(f"       Khoảng cách : {fmt_m(det['dist_m'])}")
+        print(f"       Rộng × Cao  : {fmt_m(det['width_m'])} × {fmt_m(det['height_m'])}")
+        print(f"       Tâm (px)    : Cx={det['cx_px']}  Cy={det['cy_px']}")
+    print(f"{'='*62}\n")
+
+    # ── Vẽ annotated frame cuối ──────────────────────────────────────
+    if last_left_rect is not None:
+        annotated = last_left_rect.copy()
+
+        for det in last_det_raw:
+            draw_detection(
+                annotated,
+                det["x1"], det["y1"], det["x2"], det["y2"],
+                f"{det['name']} {det['conf']:.0%}",
+                det["dist_m"], det["width_m"], det["height_m"],
+                class_colour(det["cls_id"]),
+                det["mask_poly"],
+            )
+
+        draw_burst_banner(annotated, n_burst, n_valid, summary)
+        result.annotated = annotated
+
+    if last_depth_map is not None:
+        result.depth_color = depth_to_color(last_depth_map, MAX_DEPTH_M, CALIB_UNIT)
+
+    return result
+
+
+# ===========================================================================
+#  Main loop
+# ===========================================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="YOLOv8n detection + stereo depth: distance and physical size."
+    # ── Kiểm tra file ──────────────────────────────────────────────────
+    calib_path = Path(CALIB_FILE)
+    model_path = Path(MODEL_FILE)
+
+    if not calib_path.exists():
+        sys.exit(f"[ERROR] Không tìm thấy calibration: {calib_path}")
+    if not model_path.exists():
+        sys.exit(f"[ERROR] Không tìm thấy model: {model_path}")
+
+    # ── Mở camera ──────────────────────────────────────────────────────
+    print("[INFO] Khởi động stereo camera …")
+    camera = StereoCamera(
+        left_camera_num=LEFT_CAM_NUM,
+        right_camera_num=RIGHT_CAM_NUM,
+        capture_width=CAPTURE_WIDTH,
+        capture_height=CAPTURE_HEIGHT,
+        framerate=FRAMERATE,
     )
-    parser.add_argument("--left",  default=r"D:\Lenna-Stereo-Camera\Calibration\recordings\left_20260930_164731.mp4",
-                        help="Path to left video file (default: left_20260930_164731.mp4)")
-    parser.add_argument("--right", default=r"D:\Lenna-Stereo-Camera\Calibration\recordings\right_20260930_164731.mp4",
-                        help="Path to right video file (default: right_20260930_164731.mp4)")
-    parser.add_argument("--calib", default="stereo_calibration.npz",
-                        help="Path to stereo_calibration.npz (default: stereo_calibration.npz)")
-    parser.add_argument("--model", default="yolov8n-seg.pt",
-                        help="YOLO segmentation model weights (default: yolov8n-seg.pt)")
-    parser.add_argument("--conf", type=float, default=0.35,
-                        help="YOLO confidence threshold (default: 0.35)")
-    parser.add_argument("--downscale", type=float, default=0.5,
-                        help="Downscale factor for disparity computation (default: 0.5)")
-    parser.add_argument("--calibration-unit", default="mm",
-                        choices=["mm", "cm", "m"],
-                        help="Unit used during calibration (default: mm)")
-    parser.add_argument("--max-depth", type=float, default=5.0,
-                        help="Max depth for colour scale in metres (default: 5.0)")
-    parser.add_argument("--save-video", default="",
-                        help="Export annotated result to this MP4 file")
-    parser.add_argument("--no-preview", action="store_true",
-                        help="Disable preview windows (use with --save-video)")
-    parser.add_argument("--frame-skip", type=int, default=0,
-                        help="Skip every N frames for speed (0 = process all)")
-    args = parser.parse_args()
+    if not camera.open():
+        sys.exit("[ERROR] Không mở được camera.")
+    if not camera.start():
+        camera.release()
+        sys.exit("[ERROR] Không khởi động được luồng chụp.")
 
-    # ------------------------------------------------------------------
-    # Open video captures
-    # ------------------------------------------------------------------
-    cap_l = cv2.VideoCapture(args.left)
-    cap_r = cv2.VideoCapture(args.right)
+    # ── Load depth + YOLO ──────────────────────────────────────────────
+    print(f"[INFO] Load calibration: {calib_path}")
+    depth_est = StereoDepth(str(calib_path), downscale=DEPTH_DOWNSCALE)
+    focal_px  = focal_length_from_Q(depth_est.Q)
+    print(f"[INFO] Focal length Q[2,3] = {focal_px:.2f} px")
 
-    if not cap_l.isOpened():
-        sys.exit(f"[ERROR] Cannot open left video: {args.left}")
-    if not cap_r.isOpened():
-        sys.exit(f"[ERROR] Cannot open right video: {args.right}")
+    print(f"[INFO] Load YOLO model: {model_path}")
+    yolo = YOLO(str(model_path))
+    print("[INFO] YOLO sẵn sàng.\n")
 
-    total_frames = int(min(cap_l.get(cv2.CAP_PROP_FRAME_COUNT),
-                           cap_r.get(cv2.CAP_PROP_FRAME_COUNT)))
-    src_fps      = cap_l.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_w      = int(cap_l.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h      = int(cap_l.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # ── State ──────────────────────────────────────────────────────────
+    WIN_MAIN  = "YOLO + Depth  [T=Burst  Q=Quit  D=Depth  R=Reset  S=Save  +/-=Conf]"
+    WIN_DEPTH = "Depth Map"
 
-    print(f"Left  video : {args.left}")
-    print(f"Right video : {args.right}")
-    print(f"Resolution  : {frame_w}x{frame_h}  FPS: {src_fps:.1f}")
-    print(f"Total frames: {total_frames}")
+    cv2.namedWindow(WIN_MAIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN_MAIN, CAPTURE_WIDTH, CAPTURE_HEIGHT)
 
-    # ------------------------------------------------------------------
-    # Load calibration + build depth estimator
-    # ------------------------------------------------------------------
-    if not Path(args.calib).exists():
-        sys.exit(f"[ERROR] Calibration file not found: {args.calib}")
-
-    print(f"\nLoading calibration from: {args.calib}")
-    depth_est = StereoDepth(args.calib, downscale=args.downscale)
-
-    # Extract focal length from Q matrix for physical-size calculations
-    focal_px = focal_length_from_Q(depth_est.Q)
-    print(f"Focal length (Q[2,3]) : {focal_px:.2f} px  (at calibration resolution)")
-    print("Calibration loaded.\n")
-
-    # ------------------------------------------------------------------
-    # Load YOLO model
-    # ------------------------------------------------------------------
-    print(f"Loading YOLO model : {args.model}")
-    yolo = YOLO(args.model)
-    print("YOLO model loaded.\n")
-
-    # ------------------------------------------------------------------
-    # Optional video writer
-    # ------------------------------------------------------------------
-    writer: cv2.VideoWriter | None = None
-    if args.save_video:
-        out_w = depth_est._calib_w * 2
-        out_h = depth_est._calib_h
-        writer = make_video_writer(args.save_video, out_w, out_h, src_fps)
-        print(f"Saving output to: {args.save_video}  ({out_w}x{out_h} @ {src_fps} fps)\n")
-
-    # ------------------------------------------------------------------
-    # State
-    # ------------------------------------------------------------------
-    paused        = False
-    speed         = 1.0
-    frame_idx     = 0
+    show_depth    = True
+    burst_result: Optional[BurstResult] = None
+    state         = "STANDBY"
     fps_display   = 0.0
     t_last        = time.monotonic()
-    save_snapshot = False
-    show_depth    = True
-    skip_counter  = 0
-    conf_thresh   = args.conf
-    conf_cycle_i  = _CONF_CYCLE.index(min(_CONF_CYCLE, key=lambda x: abs(x - conf_thresh)))
+    last_sequence: Optional[int] = None
+    n_det_live    = 0
+    conf_thresh   = CONF_INIT
+    snapshot_dir  = Path(SNAPSHOT_DIR)
 
-    snapshot_dir = Path("yolo_depth_snapshots")
+    print("=" * 62)
+    print("  YOLO + STEREO DEPTH – LIVE STREAM")
+    print("=" * 62)
+    print(f"  Model   : {model_path.name}")
+    print(f"  Burst   : {N_BURST} frames  |  Tổng hợp: trung vị")
+    print(f"  Conf    : {conf_thresh:.2f}")
+    print("=" * 62)
+    print("  T = Burst  |  Q = Thoát  |  D = Depth  |  R = Reset  |  S = Save")
+    print("  + = Tăng conf  |  - = Giảm conf")
+    print("=" * 62 + "\n")
 
-    print("Controls: Q/ESC=quit  SPACE=pause  S=snapshot  [=slower  ]=faster")
-    print("          R=restart  D=toggle-depth-window  T=cycle-confidence\n")
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-    while True:
-        if not paused:
-            ok_l, frame_l = cap_l.read()
-            ok_r, frame_r = cap_r.read()
-
-            if not ok_l or not ok_r:
-                print("End of video.")
-                break
-
-            frame_idx += 1
-
-            # Frame skipping
-            if args.frame_skip > 0:
-                skip_counter += 1
-                if skip_counter % (args.frame_skip + 1) != 0:
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), 27):
-                        break
-                    continue
-
-            # --------------------------------------------------------------
-            # 1. Stereo depth estimation
-            # --------------------------------------------------------------
-            t0 = time.monotonic()
-            left_rect, disparity, depth_map = depth_est.process(frame_l, frame_r)
-            t1 = time.monotonic()
-            depth_ms = (t1 - t0) * 1000.0
-
-            # --------------------------------------------------------------
-            # 2. YOLOv8n inference on the rectified left image
-            # --------------------------------------------------------------
-            t2 = time.monotonic()
-            results = yolo(left_rect, conf=conf_thresh, verbose=False)
-            t3 = time.monotonic()
-            yolo_ms = (t3 - t2) * 1000.0
-
-            detections = results[0].boxes  # ultralytics Boxes object
-
-            # --------------------------------------------------------------
-            # 3. Draw detections with distance + physical size
-            # --------------------------------------------------------------
-            annotated = left_rect.copy()
-            n_det = len(detections) if detections is not None else 0
-
-            # Extract segmentation masks (None for non-seg models)
-            seg_masks = results[0].masks   # ultralytics Masks or None
-
-            if detections is not None and n_det > 0:
-                for i, box in enumerate(detections):
-                    x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
-                    cls_id  = int(box.cls[0])
-                    conf    = float(box.conf[0])
-                    name    = yolo.names[cls_id]
-                    colour  = class_colour(cls_id)
-
-                    # ---- Extract mask polygon for this detection ----
-                    mask_polygon: np.ndarray | None = None
-                    if seg_masks is not None and i < len(seg_masks):
-                        # xy: list of (N,2) float arrays in pixel coordinates
-                        xy = seg_masks[i].xy
-                        if xy is not None and len(xy) > 0 and len(xy[0]) >= 3:
-                            mask_polygon = xy[0].astype(np.int32)
-
-                    dist_m, w_m, h_m = box_physical_size(
-                        depth_map, x1, y1, x2, y2, focal_px, args.calibration_unit
-                    )
-
-                    draw_detection(
-                        annotated,
-                        x1, y1, x2, y2,
-                        f"{name} {conf:.0%}",
-                        dist_m, w_m, h_m,
-                        colour,
-                        depth_map,
-                        mask_polygon,
-                    )
-
-                    # Console log every 30 frames
-                    if frame_idx % 30 == 0:
-                        dist_str = f"{dist_m:.2f} m" if dist_m else "N/A"
-                        size_str = (f"{w_m*100:.1f}x{h_m*100:.1f} cm"
-                                    if w_m and h_m else "N/A")
-                        print(f"  [{name:15s}] dist={dist_str:>8s}  "
-                              f"size={size_str}  conf={conf:.2f}")
-
-            # HUD overlay
+    try:
+        while True:
             t_now = time.monotonic()
             fps_display = 1.0 / max(t_now - t_last, 1e-6)
             t_last = t_now
 
-            annotated = overlay_hud(
-                annotated, frame_idx, total_frames,
-                fps_display, n_det, conf_thresh, paused, speed,
+            # ── Đọc frame ──────────────────────────────────────────────
+            ok, stereo_frame = camera.read(
+                last_sequence=last_sequence, copy_frames=False
             )
 
-            if frame_idx % 30 == 0:
-                print(f"Frame {frame_idx:5d}/{total_frames}  "
-                      f"depth={depth_ms:5.1f} ms  yolo={yolo_ms:5.1f} ms  "
-                      f"det={n_det}")
+            if not ok or stereo_frame is None:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+                if key in (ord("t"), ord("T")):
+                    state = "CAPTURING"
+                    burst_result = run_burst(
+                        camera, depth_est, yolo, focal_px, N_BURST, conf_thresh
+                    )
+                    state = "RESULT"
+                continue
 
-            # --------------------------------------------------------------
-            # 4. Colour maps for visualisation
-            # --------------------------------------------------------------
-            disp_color  = disparity_to_color(disparity)
-            depth_color = depth_to_color(depth_map, args.max_depth, args.calibration_unit)
+            last_sequence = stereo_frame.sequence
+            left_rect, _, depth_map = depth_est.process(
+                stereo_frame.left, stereo_frame.right
+            )
 
-            # --------------------------------------------------------------
-            # 5. Export frame
-            # --------------------------------------------------------------
-            if writer is not None:
-                combined = np.hstack((annotated, disp_color))
-                # Resize to expected output size if needed
-                exp_w = depth_est._calib_w * 2
-                exp_h = depth_est._calib_h
-                if combined.shape[1] != exp_w or combined.shape[0] != exp_h:
-                    combined = cv2.resize(combined, (exp_w, exp_h))
-                writer.write(combined)
+            # ── YOLO live ──────────────────────────────────────────────
+            results_live = yolo(left_rect, conf=conf_thresh, verbose=False)
+            boxes_live   = results_live[0].boxes
+            masks_live   = results_live[0].masks
+            n_det_live   = len(boxes_live) if boxes_live is not None else 0
 
-            # --------------------------------------------------------------
-            # 6. Preview windows
-            # --------------------------------------------------------------
-            if not args.no_preview:
-                cv2.imshow("YOLOv8 + Stereo Depth  [Q=quit SPACE=pause S=snap T=conf]",
-                           annotated)
-                if show_depth:
-                    cv2.imshow("Depth Map (Plasma)", depth_color)
-                    cv2.imshow("Disparity Map", disp_color)
-                else:
-                    cv2.destroyWindow("Depth Map (Plasma)")
-                    cv2.destroyWindow("Disparity Map")
+            depth_color_live = depth_to_color(depth_map, MAX_DEPTH_M, CALIB_UNIT)
 
-            # --------------------------------------------------------------
-            # 7. Snapshot
-            # --------------------------------------------------------------
-            if save_snapshot:
+            # ── Chọn display ───────────────────────────────────────────
+            if burst_result is not None and burst_result.annotated is not None:
+                display       = burst_result.annotated.copy()
+                depth_display = (burst_result.depth_color
+                                 if burst_result.depth_color is not None
+                                 else depth_color_live)
+            else:
+                display = left_rect.copy()
+
+                if boxes_live is not None and n_det_live > 0:
+                    for i, box in enumerate(boxes_live):
+                        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
+                        cls_id = int(box.cls[0])
+                        conf_v = float(box.conf[0])
+                        name   = yolo.names[cls_id]
+
+                        mask_poly = None
+                        if masks_live is not None and i < len(masks_live):
+                            xy = masks_live[i].xy
+                            if xy is not None and len(xy) > 0 and len(xy[0]) >= 3:
+                                mask_poly = xy[0].astype(np.int32)
+
+                        dist_m, w_m, h_m = box_physical_size(
+                            depth_map, x1, y1, x2, y2, focal_px, CALIB_UNIT
+                        )
+                        draw_detection(
+                            display, x1, y1, x2, y2,
+                            f"{name} {conf_v:.0%}",
+                            dist_m, w_m, h_m,
+                            class_colour(cls_id),
+                            mask_poly,
+                        )
+
+                depth_display = depth_color_live
+
+            draw_hud(display, state, n_det_live, fps_display, conf_thresh)
+
+            cv2.imshow(WIN_MAIN, display)
+            if show_depth:
+                cv2.imshow(WIN_DEPTH, depth_display)
+            else:
+                cv2.destroyWindow(WIN_DEPTH)
+
+            # ── Key handling ───────────────────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+
+            if key in (ord("q"), 27):
+                break
+
+            elif key in (ord("t"), ord("T")):
+                state = "CAPTURING"
+                cv2.waitKey(1)
+                burst_result = run_burst(
+                    camera, depth_est, yolo, focal_px, N_BURST, conf_thresh
+                )
+                state = "RESULT"
+
+            elif key in (ord("d"), ord("D")):
+                show_depth = not show_depth
+
+            elif key in (ord("r"), ord("R")):
+                burst_result = None
+                state = "STANDBY"
+
+            elif key in (ord("s"), ord("S")):
                 snapshot_dir.mkdir(parents=True, exist_ok=True)
-                tag = f"frame{frame_idx:05d}"
-                cv2.imwrite(str(snapshot_dir / f"{tag}_annotated.png"), annotated)
-                cv2.imwrite(str(snapshot_dir / f"{tag}_disparity.png"), disp_color)
-                cv2.imwrite(str(snapshot_dir / f"{tag}_depth.png"), depth_color)
-                np.save(str(snapshot_dir / f"{tag}_depth_raw.npy"), depth_map)
-                print(f"  Snapshot -> {snapshot_dir}/{tag}_*.png")
-                save_snapshot = False
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                cv2.imwrite(str(snapshot_dir / f"yolo_depth_{ts}.jpg"), display)
+                if burst_result and burst_result.depth_color is not None:
+                    cv2.imwrite(
+                        str(snapshot_dir / f"yolo_depth_{ts}_depthmap.jpg"),
+                        burst_result.depth_color,
+                    )
+                print(f"[SAVE] Đã lưu vào: {snapshot_dir}/yolo_depth_{ts}*.jpg")
 
-            # Throttle
-            delay_ms = max(1, int(1000.0 / (src_fps * speed)))
+            elif key == ord("+") or key == ord("="):
+                conf_thresh = min(conf_thresh + 0.05, 0.95)
+                burst_result = None
+                state = "STANDBY"
+                print(f"[CONF] Confidence → {conf_thresh:.2f}")
 
-        else:
-            delay_ms = 50
+            elif key == ord("-") or key == ord("_"):
+                conf_thresh = max(conf_thresh - 0.05, 0.05)
+                burst_result = None
+                state = "STANDBY"
+                print(f"[CONF] Confidence → {conf_thresh:.2f}")
 
-        # ------------------------------------------------------------------
-        # Key handling
-        # ------------------------------------------------------------------
-        key = cv2.waitKey(delay_ms) & 0xFF
-
-        if key in (ord("q"), 27):           # Q / ESC
-            break
-        elif key == ord(" "):               # SPACE – pause/resume
-            paused = not paused
-            print("Paused." if paused else "Resumed.")
-        elif key == ord("s"):               # S – snapshot
-            save_snapshot = True
-        elif key == ord("]"):               # ] – faster
-            speed = min(speed * 2.0, 16.0)
-            print(f"Speed: {speed:.2f}x")
-        elif key == ord("["):               # [ – slower
-            speed = max(speed / 2.0, 0.125)
-            print(f"Speed: {speed:.2f}x")
-        elif key == ord("r"):               # R – restart
-            cap_l.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            cap_r.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            frame_idx = 0
-            print("Restarted.")
-        elif key == ord("d"):               # D – toggle depth windows
-            show_depth = not show_depth
-            print(f"Depth windows: {'ON' if show_depth else 'OFF'}")
-        elif key == ord("t"):               # T – cycle confidence
-            conf_cycle_i = (conf_cycle_i + 1) % len(_CONF_CYCLE)
-            conf_thresh  = _CONF_CYCLE[conf_cycle_i]
-            print(f"Confidence threshold: {conf_thresh:.2f}")
-
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-    cap_l.release()
-    cap_r.release()
-    if writer is not None:
-        writer.release()
-        print(f"\nOutput video saved to: {args.save_video}")
-    cv2.destroyAllWindows()
-    print("Done.")
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+        print("[INFO] Đã thoát.")
 
 
 if __name__ == "__main__":
