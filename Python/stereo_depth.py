@@ -15,7 +15,16 @@ class StereoDepth:
         self.downscale = downscale
 
         block_size = 7
-        num_disp = 128 if downscale >= 1.0 else 96  # can drop further if needed
+
+        # Z_min = (focal_px × baseline_m) / numDisparities_effective
+        # numDisparities_effective = num_disp / downscale
+        # Tăng num_disp → đo được gần hơn, nhưng chậm hơn.
+        # Phải là bội số của 16.
+        # downscale=0.5 → effective = num_disp / 0.5
+        #   96  → effective 192 px → Z_min ≈ 0.40 m
+        #   160 → effective 320 px → Z_min ≈ 0.24 m
+        #   208 → effective 416 px → Z_min ≈ 0.18 m
+        num_disp = 160 if downscale >= 1.0 else 208
 
         self.matcher = cv2.StereoSGBM_create(
             minDisparity=0,
