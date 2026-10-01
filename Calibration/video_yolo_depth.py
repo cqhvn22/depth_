@@ -60,8 +60,8 @@ except ImportError:
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Đường dẫn mặc định (có thể override bằng --left, --right, --calib, --model)
-DEFAULT_LEFT:  str = str(_SCRIPT_DIR / "recordings" / "left_20260930_164731.mp4")
-DEFAULT_RIGHT: str = str(_SCRIPT_DIR / "recordings" / "right_20260930_164731.mp4")
+DEFAULT_LEFT:  str = str(_SCRIPT_DIR / "recordings" / "left_20261001_125816.mp4")
+DEFAULT_RIGHT: str = str(_SCRIPT_DIR / "recordings" / "right_20261001_125816.mp4")
 DEFAULT_CALIB: str = str(_SCRIPT_DIR / "stereo_calibration.npz")
 DEFAULT_MODEL: str = str(_SCRIPT_DIR / "best.pt")
 SNAPSHOT_DIR:  str = "yolo_depth_snapshots"
