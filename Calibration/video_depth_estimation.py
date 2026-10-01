@@ -353,9 +353,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Stereo depth estimation from recorded left/right video files."
     )
-    parser.add_argument("--left", default=str(script_dir / "left_20260928_134412.mp4"),
+    parser.add_argument("--left", default=str(script_dir / "recordings" / "left_20261001_125816.mp4"),
                         help="Path to the left video file")
-    parser.add_argument("--right", default=str(script_dir / "right_20260928_134412.mp4"),
+    parser.add_argument("--right", default=str(script_dir / "recordings" / "right_20261001_125816.mp4"),
                         help="Path to the right video file")
     parser.add_argument("--calib",
                         default=str(script_dir / "stereo_calibration.npz"),
