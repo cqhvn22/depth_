@@ -687,8 +687,9 @@ def draw_perch_detection(
     height_m: float | None,
     verdict: bool | None,
     mask_polygon: np.ndarray | None = None,
+    axis: dict | None = None,
 ) -> None:
-    """Vẽ detection box/mask, nhãn kích thước (nếu có depth), verdict lên ảnh."""
+    """Vẽ detection box xoay chéo (Oriented Bounding Box), nhãn kích thước (nếu có depth), verdict lên ảnh."""
     if verdict is True:
         colour = COLOR_OK
     elif verdict is False:
@@ -699,26 +700,39 @@ def draw_perch_detection(
     overlay = img.copy()
     alpha   = 0.28
 
+    # Lấy thông tin trục và góc xoay của thanh
+    if axis is None:
+        axis = bar_axis_2d((x1, y1, x2, y2), mask_polygon)
+
+    cx_f, cy_f = axis["center"]
+    vx, vy = axis["dir"]
+    nx, ny = -vy, vx
+    hl = axis["length_px"] / 2.0
+    hw = axis["thick_px"] / 2.0
+
+    # 4 đỉnh của khung hình chữ nhật xoay chéo bám sát theo thanh (Rotated Bounding Box)
+    rot_box = np.array([
+        (cx_f + vx * hl + nx * hw, cy_f + vy * hl + ny * hw),
+        (cx_f - vx * hl + nx * hw, cy_f - vy * hl + ny * hw),
+        (cx_f - vx * hl - nx * hw, cy_f - vy * hl - ny * hw),
+        (cx_f + vx * hl - nx * hw, cy_f + vy * hl - ny * hw),
+    ], dtype=np.int32)
+
+    cx, cy = int(cx_f), int(cy_f)
+
+    # 1. Fill nền mờ + vẽ 4 cạnh hình chữ nhật xoay chéo
+    cv2.fillPoly(overlay, [rot_box], colour)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    cv2.polylines(img, [rot_box], True, colour, 2, cv2.LINE_AA)
+    bright = tuple(min(255, int(c * 1.5)) for c in colour)
+    cv2.polylines(img, [rot_box], True, bright, 1, cv2.LINE_AA)
+
+    # 2. Nếu có mask polygon segmentation thì vẽ viền nét mảnh theo mask
     if mask_polygon is not None and len(mask_polygon) >= 3:
         pts = mask_polygon.reshape((-1, 1, 2)).astype(np.int32)
-        cv2.fillPoly(overlay, [pts], colour)
-        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
-        cv2.polylines(img, [pts], True, colour, 3, cv2.LINE_AA)
-        bright = tuple(min(255, int(c * 1.5)) for c in colour)
-        cv2.polylines(img, [pts], True, bright, 1, cv2.LINE_AA)
-        M = cv2.moments(pts)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-        else:
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    else:
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), colour, -1)
-        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
-        cv2.rectangle(img, (x1, y1), (x2, y2), colour, 2)
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        cv2.polylines(img, [pts], True, (0, 255, 255), 1, cv2.LINE_AA)
 
-    # Crosshair
+    # Crosshair tại tâm thanh
     arm = 14
     cv2.line(img, (cx - arm, cy), (cx + arm, cy), (0, 255, 180), 2)
     cv2.line(img, (cx, cy - arm), (cx, cy + arm), (0, 255, 180), 2)
