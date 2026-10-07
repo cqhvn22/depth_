@@ -105,9 +105,10 @@ MIN_DIST_M:   float = 0.20
 MAX_DIST_M:   float = 5.00
 
 # ---------- Căn chỉnh drone (alignment) ---------------------------------
-YAW_TOL_DEG:    float = 3.0   # |yaw| <= ngưỡng này → coi như song song với thanh
-ANGLE_TOL_DEG:  float = 3.0   # |góc nghiêng thanh trong ảnh| <= ngưỡng → OK
-CENTER_TOL_PX:  int   = 25    # độ lệch tâm (px) cho phép so với 2 trục căn
+YAW_TOL_DEG:       float = 3.0   # |yaw| <= ngưỡng này → coi như song song với thanh
+ANGLE_TOL_DEG:     float = 3.0   # |góc nghiêng thanh trong ảnh| <= ngưỡng → OK
+CENTER_TOL_PX:     int   = 25    # độ lệch tâm (px) cho phép so với 2 trục căn
+MAX_BAR_ANGLE_DEG: float = 25.0  # Góc lệch tối đa so với phương ngang (độ) để nhận diện/vẽ bbox
 
 # ---------- Hiển thị -----------------------------------------------------
 SHOW_DEPTH_ON_START: bool = True   # True = mở cửa sổ depth map sau khi bấm T
@@ -165,8 +166,11 @@ def rectify_left(depth_est: StereoDepth, left: np.ndarray) -> np.ndarray:
                      cv2.INTER_LINEAR)
 
 
-def extract_detections(yolo_result, names) -> list[dict]:
-    """Chuyển kết quả YOLO thành list dict, sắp xếp theo confidence giảm dần."""
+def extract_detections(yolo_result, names, max_angle_deg: float = MAX_BAR_ANGLE_DEG) -> list[dict]:
+    """
+    Chuyển kết quả YOLO thành list dict, sắp xếp theo confidence giảm dần.
+    Chỉ giữ lại những thanh có góc lệch phương ngang <= max_angle_deg (tối đa 25 độ).
+    """
     dets: list[dict] = []
     boxes = yolo_result.boxes
     masks = yolo_result.masks
@@ -184,11 +188,16 @@ def extract_detections(yolo_result, names) -> list[dict]:
             if xy is not None and len(xy) > 0 and len(xy[0]) >= 3:
                 mask_poly = xy[0].astype(np.int32)
 
+        axis = bar_axis_2d((x1, y1, x2, y2), mask_poly)
+        if max_angle_deg is not None and abs(axis["angle_deg"]) > max_angle_deg:
+            continue  # Bỏ qua những thanh có góc lệch phương ngang > 25 độ
+
         dets.append({
             "box":       (x1, y1, x2, y2),
             "name":      names[cls_id],
             "conf":      conf_v,
             "mask_poly": mask_poly,
+            "axis":      axis,
         })
 
     dets.sort(key=lambda d: d["conf"], reverse=True)
@@ -1238,6 +1247,7 @@ def main() -> None:
     print(f"    Khoảng cách : [{MIN_DIST_M*100:.0f}, {MAX_DIST_M*100:.0f}] cm")
     print(f"    Chiều dài   : [{MIN_LENGTH_M*100:.0f}, {MAX_LENGTH_M*100:.0f}] cm")
     print(f"    Chiều rộng  : [{MIN_WIDTH_M*100:.0f}, {MAX_WIDTH_M*100:.0f}] cm")
+    print(f"    Góc ngang max: ±{MAX_BAR_ANGLE_DEG:.1f} deg")
     print(f"    Yaw tol     : ±{YAW_TOL_DEG:.1f} deg   |   Center tol: ±{CENTER_TOL_PX}px")
     print(f"  Camera mount  : {CAMERA_MOUNT}")
     print(f"  Burst size    : {N_BURST} frames")
