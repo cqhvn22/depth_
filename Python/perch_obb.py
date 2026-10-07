@@ -66,7 +66,8 @@ except ImportError:
 
 # ---------- Đường dẫn file -----------------------------------------------
 CALIB_FILE: str = str(_CALIB_DIR / "stereo_calibration.npz")  # file calibration
-MODEL_FILE: str = str(_CALIB_DIR / "best_obb.pt")              # model YOLOv8n-OBB (train bằng train_cylinder_seg_colab.ipynb)
+MODEL_FILE: str = str(_CALIB_DIR / "best_obb_ncnn_model")      # model NCNN (tạo bằng export_obb_ncnn.py)
+MODEL_FILE_FALLBACK: str = str(_CALIB_DIR / "best_obb.pt")      # dùng tạm nếu chưa export (chạy chậm hơn)
 SNAPSHOT_DIR: str = "perch_snapshots"                           # thư mục lưu ảnh
 
 # ---------- Camera (Picamera2 trên Raspberry Pi 5) -----------------------
@@ -89,6 +90,7 @@ CALIB_UNIT:      str   = "mm"  # đơn vị của file calibration (mm / cm / m)
 MAX_DEPTH_M:     float = 5.0   # giới hạn hiển thị depth colormap (mét)
 
 # ---------- YOLO ---------------------------------------------------------
+YOLO_IMGSZ:   int   = 416    # kích thước input (phải bằng imgsz lúc export NCNN)
 YOLO_CONF:    float = 0.35   # ngưỡng confidence
 
 # ---------- Burst (số frame thu thập mỗi lần bấm T) ---------------------
@@ -1047,7 +1049,7 @@ def run_burst(
         left_rect, _, depth_map = depth_est.process(fl, fr)
 
         # YOLO
-        dets = extract_detections(yolo(left_rect, conf=conf, verbose=False)[0],
+        dets = extract_detections(yolo(left_rect, conf=conf, imgsz=YOLO_IMGSZ, verbose=False)[0],
                                   yolo.names)
 
         for d in dets:
@@ -1229,10 +1231,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     model_path = Path(MODEL_FILE)
     if not model_path.exists():
-        sys.exit(f"[ERROR] YOLO model not found: {model_path}")
+        fb = Path(MODEL_FILE_FALLBACK)
+        if not fb.exists():
+            sys.exit(f"[ERROR] YOLO model not found: {model_path} (chạy export_obb_ncnn.py)")
+        print(f"[WARN] Chưa có {model_path.name}, dùng tạm {fb.name} (chậm).")
+        model_path = fb
 
     print(f"[INFO] Loading YOLO model: {model_path}")
-    yolo = YOLO(str(model_path))
+    yolo = YOLO(str(model_path), task="obb")
     print("[INFO] YOLO ready.\n")
 
     # ------------------------------------------------------------------
@@ -1303,7 +1309,7 @@ def main() -> None:
 
             left_rect = rectify_left(depth_est, fl)
             dets = extract_detections(
-                yolo(left_rect, conf=conf_thresh, verbose=False)[0], yolo.names
+                yolo(left_rect, conf=conf_thresh, imgsz=YOLO_IMGSZ, verbose=False)[0], yolo.names
             )
             n_det_live = len(dets)
 
