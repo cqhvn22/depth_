@@ -11,9 +11,9 @@ Toàn bộ tham số được cài sẵn trong khối CONFIG bên dưới.
 Không cần truyền tham số từ terminal.
 
 Luồng hoạt động:
-    1. SEARCHING (realtime) – chỉ rectify ảnh trái + YOLO tìm thanh đáp.
-       KHÔNG tính depth để giữ FPS cao. Hiển thị 2 trục dọc/ngang ở tâm
-       ảnh để căn, góc nghiêng của thanh trong ảnh và độ lệch tâm.
+    1. SEARCHING (realtime) – tính depth (stereo SGBM+WLS) & phát hiện thanh
+       đáp bằng tương phản độ sâu + fit hình chữ nhật xoay OBB. Hiển thị 2 trục
+       dọc/ngang ở tâm ảnh để căn, góc nghiêng 2D xoay của thanh và độ lệch tâm.
     2. Bấm T – burst N frame, tính depth (stereo SGBM+WLS), kích thước
        thanh, khoảng cách, và GÓC YAW drone đang lệch so với thanh
        (dựa trên 3D) → thông báo cần xoay drone TRÁI/PHẢI bao nhiêu độ
@@ -53,10 +53,6 @@ from video_depth_estimation import (
     depth_to_color,
 )
 
-try:
-    from ultralytics import YOLO
-except ImportError:
-    sys.exit("[ERROR] ultralytics not installed. Run: pip install ultralytics")
 
 
 # ===========================================================================
@@ -66,8 +62,6 @@ except ImportError:
 
 # ---------- Đường dẫn file -----------------------------------------------
 CALIB_FILE: str = str(_CALIB_DIR / "stereo_calibration.npz")  # file calibration
-MODEL_FILE: str = str(_CALIB_DIR / "best_obb_ncnn_model")      # model NCNN (tạo bằng export_obb_ncnn.py)
-MODEL_FILE_FALLBACK: str = str(_CALIB_DIR / "best_obb.pt")      # dùng tạm nếu chưa export (chạy chậm hơn)
 SNAPSHOT_DIR: str = "perch_snapshots"                           # thư mục lưu ảnh
 
 # ---------- Camera (Picamera2 trên Raspberry Pi 5) -----------------------
@@ -89,9 +83,10 @@ DEPTH_DOWNSCALE: float = 0.5   # hệ số thu nhỏ ảnh khi tính disparity (
 CALIB_UNIT:      str   = "mm"  # đơn vị của file calibration (mm / cm / m)
 MAX_DEPTH_M:     float = 5.0   # giới hạn hiển thị depth colormap (mét)
 
-# ---------- YOLO ---------------------------------------------------------
-YOLO_IMGSZ:   int   = 416    # kích thước input (phải bằng imgsz lúc export NCNN)
-YOLO_CONF:    float = 0.35   # ngưỡng confidence
+# ---------- Nhận diện hình trụ/chữ nhật qua Depth Map (không cần YOLO) --
+MIN_ASPECT_RATIO:   float = 1.4    # Tỷ lệ dài/rộng tối thiểu của thanh hình chữ nhật
+MIN_RECTANGULARITY: float = 0.40   # Độ phủ hình chữ nhật (diện tích contour / diện tích OBB)
+DEPTH_CONTRAST_M:   float = 0.10   # Chênh lệch độ sâu tối thiểu so với nền xung quanh (mét)
 
 # ---------- Burst (số frame thu thập mỗi lần bấm T) ---------------------
 N_BURST: int = 7
@@ -168,43 +163,126 @@ def rectify_left(depth_est: StereoDepth, left: np.ndarray) -> np.ndarray:
                      cv2.INTER_LINEAR)
 
 
-def extract_detections(yolo_result, names, max_angle_deg: float = MAX_BAR_ANGLE_DEG) -> list[dict]:
+def extract_detections_from_depth(
+    depth_map: np.ndarray,
+    focal_px: float,
+    calib_unit: str = "mm",
+    max_angle_deg: float = MAX_BAR_ANGLE_DEG,
+) -> list[dict]:
     """
-    Chuyển kết quả YOLO thành list dict, sắp xếp theo confidence giảm dần.
-    Chỉ giữ lại những thanh có góc lệch phương ngang <= max_angle_deg (tối đa 25 độ).
+    Phát hiện thanh đáp hình trụ/chữ nhật trực tiếp từ bản đồ độ sâu (depth map).
+    - Segment các vùng có độ tương phản độ sâu (nổi bật lên so với nền).
+    - Lọc theo hình dạng chữ nhật xoay (cv2.minAreaRect - OBB, chấp nhận nghiêng chéo góc).
+    - Lọc theo tỷ lệ khía cạnh (dài/rộng) và kích thước vật lý (mét).
+    - Tính toán góc nghiêng 2D xoay (OBB rotated angle) gợi ý căn chỉnh cho drone.
     """
     dets: list[dict] = []
-    obb = getattr(yolo_result, "obb", None)
-    if obb is None or len(obb) == 0:
+    if depth_map is None or depth_map.size == 0:
         return dets
 
-    # OBB: 4 góc của box xoay (N,4,2) – dùng trực tiếp để tính góc chuẩn
-    corners_all = obb.xyxyxyxy.cpu().numpy().reshape(-1, 4, 2)
-    cls_all = obb.cls.cpu().numpy().astype(int)
-    conf_all = obb.conf.cpu().numpy()
+    h_img, w_img = depth_map.shape[:2]
+    depth_m = to_metres(depth_map.astype(np.float32), calib_unit)
 
-    for i in range(len(obb)):
-        corners = corners_all[i]
-        x1, y1 = (int(v) for v in np.floor(corners.min(axis=0)))
-        x2, y2 = (int(v) for v in np.ceil(corners.max(axis=0)))
-        cls_id = int(cls_all[i])
-        conf_v = float(conf_all[i])
-        mask_poly: Optional[np.ndarray] = corners.astype(np.int32)
+    # 1. Mask các pixel độ sâu hợp lệ trong khoảng [MIN_DIST_M, MAX_DIST_M]
+    valid_mask = (depth_m >= MIN_DIST_M) & (depth_m <= MAX_DIST_M) & np.isfinite(depth_m)
+    if valid_mask.sum() < 30:
+        return dets
 
-        axis = bar_axis_2d((x1, y1, x2, y2), mask_poly)
+    # 2. Phát hiện tương phản độ sâu (Depth Contrast)
+    # Lọc nhiễu độ sâu bằng median filter
+    depth_smooth = cv2.medianBlur(depth_m.astype(np.float32), 5)
+
+    # Morphological Dilate để ước lượng độ sâu nền xung quanh (vùng lân cận)
+    kernel_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    depth_valid_fill = np.where(valid_mask, depth_smooth, 0.0)
+    bg_depth = cv2.dilate(depth_valid_fill, kernel_bg)
+
+    # Chênh lệch độ sâu: Nền xa hơn vật thể (bg_depth > depth_smooth)
+    depth_diff = bg_depth - depth_smooth
+    contrast_bin = ((depth_diff >= DEPTH_CONTRAST_M) & valid_mask).astype(np.uint8) * 255
+
+    # Đóng khe hở trong mask
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask_clean = cv2.morphologyEx(contrast_bin, cv2.MORPH_CLOSE, kernel_close)
+
+    # 3. Tìm contours của các vùng tương phản độ sâu
+    contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    for c in contours:
+        area_px = cv2.contourArea(c)
+        if area_px < 50:  # Bỏ qua nhiễu quá nhỏ
+            continue
+
+        # Fit hình chữ nhật xoay (Oriented Bounding Box - OBB, có thể chéo góc)
+        rect = cv2.minAreaRect(c)
+        (cx, cy), (rw, rh), angle = rect
+        corners = cv2.boxPoints(rect)
+        corners_int = corners.astype(np.int32)
+
+        length_px = max(rw, rh)
+        thick_px = min(rw, rh)
+        if thick_px < 2.0:
+            continue
+
+        aspect_ratio = length_px / thick_px
+        if aspect_ratio < MIN_ASPECT_RATIO:
+            continue  # Bỏ qua nếu không đủ dạng thanh/chữ nhật dài
+
+        rect_area = length_px * thick_px
+        rectangularity = area_px / max(rect_area, 1.0)
+        if rectangularity < MIN_RECTANGULARITY:
+            continue  # Bỏ qua nếu không đủ đặc dạng chữ nhật
+
+        # Tọa độ bounding box bao ngoài
+        x1, y1 = int(np.floor(corners[:, 0].min())), int(np.floor(corners[:, 1].min()))
+        x2, y2 = int(np.ceil(corners[:, 0].max())), int(np.ceil(corners[:, 1].max()))
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_img - 1, x2), min(h_img - 1, y2)
+
+        # Lấy median depth vùng vật thể
+        roi_depth = depth_m[y1:y2+1, x1:x2+1]
+        roi_valid = roi_depth[np.isfinite(roi_depth) & (roi_depth >= MIN_DIST_M) & (roi_depth <= MAX_DIST_M)]
+        if roi_valid.size < 5:
+            continue
+
+        obj_depth_m = float(np.median(roi_valid))
+
+        # Tính kích thước vật lý (mét)
+        if focal_px > 0 and obj_depth_m > 0:
+            length_m = (length_px * obj_depth_m) / focal_px
+            thick_m = (thick_px * obj_depth_m) / focal_px
+        else:
+            length_m, thick_m = None, None
+
+        # Kiểm tra giới hạn kích thước vật lý
+        if length_m is not None and thick_m is not None:
+            if not (MIN_LENGTH_M <= length_m <= MAX_LENGTH_M):
+                continue
+            if not (MIN_WIDTH_M <= thick_m <= MAX_WIDTH_M):
+                continue
+
+        # Tính góc nghiêng & trục 2D của thanh
+        axis = bar_axis_2d((x1, y1, x2, y2), corners_int)
         if max_angle_deg is not None and abs(axis["angle_deg"]) > max_angle_deg:
-            continue  # Bỏ qua những thanh có góc lệch phương ngang > 25 độ
+            continue  # Bỏ qua nếu góc quá nghiêng so với phương ngang
+
+        # Độ tin cậy (Confidence score) dựa trên độ chữ nhật và tỷ lệ dài/rộng
+        conf_v = float(np.clip(rectangularity * 0.6 + min(aspect_ratio / 4.0, 1.0) * 0.4, 0.1, 0.99))
 
         dets.append({
             "box":       (x1, y1, x2, y2),
-            "name":      names[cls_id],
+            "name":      "cylinder_bar",
             "conf":      conf_v,
-            "mask_poly": mask_poly,
+            "mask_poly": corners_int,
             "axis":      axis,
+            "dist_m":    obj_depth_m,
+            "width_m":   length_m,
+            "height_m":  thick_m,
         })
 
     dets.sort(key=lambda d: d["conf"], reverse=True)
     return dets
+
 
 
 def box_physical_size(
@@ -1008,15 +1086,13 @@ def _median(vals: list[float]) -> float | None:
 def run_burst(
     source,
     depth_est: StereoDepth,
-    yolo: YOLO,
     focal_px: float,
     n_burst: int = N_BURST,
-    conf: float = 0.35,
 ) -> BurstResult:
     """
-    Thu thập n_burst frame, chạy depth + YOLO trên từng frame, tính kích
-    thước + góc yaw của thanh mục tiêu (detection conf cao nhất), tổng hợp
-    kết quả bằng trung vị.
+    Thu thập n_burst frame, chạy stereo depth trên từng frame, phát hiện thanh
+    mục tiêu bằng tương phản độ sâu và hình dạng chữ nhật xoay (OBB), tính kích
+    thước + góc yaw của thanh, tổng hợp kết quả bằng trung vị.
     """
     result = BurstResult()
     result.n_frames = n_burst
@@ -1045,18 +1121,11 @@ def run_burst(
             print(f"  [BURST] Frame {frame_i+1}: read failed, skipping.")
             continue
 
-        # Depth (chỉ tính ở đây – không tính trong realtime)
+        # Stereo Depth
         left_rect, _, depth_map = depth_est.process(fl, fr)
 
-        # YOLO
-        dets = extract_detections(yolo(left_rect, conf=conf, imgsz=YOLO_IMGSZ, verbose=False)[0],
-                                  yolo.names)
-
-        for d in dets:
-            x1, y1, x2, y2 = d["box"]
-            d["dist_m"], d["width_m"], d["height_m"] = box_physical_size(
-                depth_map, x1, y1, x2, y2, focal_px, CALIB_UNIT
-            )
+        # Phát hiện thanh đáp trực tiếp từ Depth Map
+        dets = extract_detections_from_depth(depth_map, focal_px, CALIB_UNIT)
 
         frame_axis = None
         yaw_v = len3d = None
@@ -1225,21 +1294,7 @@ def main() -> None:
     depth_est = StereoDepth(str(calib_path), downscale=DEPTH_DOWNSCALE)
     focal_px  = focal_length_from_Q(depth_est.Q)
     print(f"[INFO] Focal length Q[2,3] = {focal_px:.2f} px")
-
-    # ------------------------------------------------------------------
-    # Load YOLO
-    # ------------------------------------------------------------------
-    model_path = Path(MODEL_FILE)
-    if not model_path.exists():
-        fb = Path(MODEL_FILE_FALLBACK)
-        if not fb.exists():
-            sys.exit(f"[ERROR] YOLO model not found: {model_path} (chạy export_obb_ncnn.py)")
-        print(f"[WARN] Chưa có {model_path.name}, dùng tạm {fb.name} (chậm).")
-        model_path = fb
-
-    print(f"[INFO] Loading YOLO model: {model_path}")
-    yolo = YOLO(str(model_path), task="obb")
-    print("[INFO] YOLO ready.\n")
+    print("[INFO] Depth Estimation Engine ready.\n")
 
     # ------------------------------------------------------------------
     # State
@@ -1252,17 +1307,16 @@ def main() -> None:
     t_last         = time.monotonic()
     snapshot_dir   = Path(SNAPSHOT_DIR)
     n_det_live     = 0
-    conf_thresh    = YOLO_CONF
     display: Optional[np.ndarray] = None
 
-    WIN_MAIN  = "Perch Detector  [T=Analyze  K=Continue  D=Depth  S=Save  Q=Quit]"
+    WIN_MAIN  = "Perch Detector (Depth-based OBB)  [T=Analyze  K=Continue  D=Depth  S=Save  Q=Quit]"
     WIN_DEPTH = "Depth Map"
 
     cv2.namedWindow(WIN_MAIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN_MAIN, WINDOW_WIDTH, WINDOW_HEIGHT)
 
     print("=" * 62)
-    print("  DRONE PERCH FEASIBILITY DETECTOR")
+    print("  DRONE PERCH FEASIBILITY DETECTOR (DEPTH-BASED OBB)")
     print("=" * 62)
     print(f"  Ngưỡng đánh giá:")
     print(f"    Khoảng cách : [{MIN_DIST_M*100:.0f}, {MAX_DIST_M*100:.0f}] cm")
@@ -1272,9 +1326,8 @@ def main() -> None:
     print(f"    Yaw tol     : ±{YAW_TOL_DEG:.1f} deg   |   Center tol: ±{CENTER_TOL_PX}px")
     print(f"  Camera mount  : {CAMERA_MOUNT}")
     print(f"  Burst size    : {N_BURST} frames")
-    print(f"  YOLO conf     : {YOLO_CONF}")
     print("=" * 62)
-    print("  Realtime: chỉ tìm thanh đáp (không depth)")
+    print("  Realtime: tính depth map & phát hiện thanh đáp bằng tương phản độ sâu")
     print("  T = Phân tích (depth + yaw + verdict)  |  K = Tiếp tục tìm")
     print("  D = Depth  |  S = Save  |  Q = Thoát")
     print("=" * 62 + "\n")
@@ -1289,10 +1342,10 @@ def main() -> None:
             # ------------------------------------------------------------
             display = burst_result.annotated.copy()
             draw_hud_top(display, state, len(burst_result.detections_info),
-                         fps_display, conf_thresh)
+                         fps_display, 0.0)
         else:
             # ------------------------------------------------------------
-            # SEARCHING: chỉ rectify ảnh trái + YOLO (KHÔNG tính depth)
+            # SEARCHING: Tính stereo depth & phát hiện vật thể bằng contrast độ sâu
             # ------------------------------------------------------------
             state = "SEARCHING"
             t_now       = time.monotonic()
@@ -1300,17 +1353,15 @@ def main() -> None:
             t_last      = t_now
 
             ok, fl, fr = source.read()
-            if not ok or fl is None:
+            if not ok or fl is None or fr is None:
                 time.sleep(0.01)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 continue
 
-            left_rect = rectify_left(depth_est, fl)
-            dets = extract_detections(
-                yolo(left_rect, conf=conf_thresh, imgsz=YOLO_IMGSZ, verbose=False)[0], yolo.names
-            )
+            left_rect, _, depth_map = depth_est.process(fl, fr)
+            dets = extract_detections_from_depth(depth_map, focal_px, CALIB_UNIT)
             n_det_live = len(dets)
 
             display = left_rect.copy()
@@ -1319,7 +1370,7 @@ def main() -> None:
                 draw_perch_detection(
                     display, x1, y1, x2, y2,
                     f"{'TARGET ' if j == 0 else ''}{d['name']} {d['conf']:.0%}",
-                    None, None, None, None, d["mask_poly"],
+                    d["dist_m"], d["width_m"], d["height_m"], None, d["mask_poly"],
                 )
 
             h_img, w_img = display.shape[:2]
@@ -1332,7 +1383,7 @@ def main() -> None:
 
             draw_alignment_guides(display, axis, guidance)
             draw_guidance_panel(display, guidance)
-            draw_hud_top(display, state, n_det_live, fps_display, conf_thresh)
+            draw_hud_top(display, state, n_det_live, fps_display, 0.0)
 
         # Hiển thị
         cv2.imshow(WIN_MAIN, display)
@@ -1358,7 +1409,7 @@ def main() -> None:
         elif key == ord("t"):           # T → phân tích (burst + depth + yaw)
             state = "ANALYZING"
             busy = display.copy()
-            draw_hud_top(busy, state, n_det_live, fps_display, conf_thresh)
+            draw_hud_top(busy, state, n_det_live, fps_display, 0.0)
             draw_yaw_indicator(busy, None, busy.shape[0] // 2)
             cv2.putText(busy, "ANALYZING (depth + yaw) ...",
                         (busy.shape[1] // 2 - 170, busy.shape[0] // 2 - 50),
@@ -1367,9 +1418,8 @@ def main() -> None:
             cv2.waitKey(1)
 
             burst_result = run_burst(
-                source, depth_est, yolo, focal_px,
+                source, depth_est, focal_px,
                 n_burst=N_BURST,
-                conf=conf_thresh,
             )
             state = "RESULT"
 
