@@ -1197,97 +1197,6 @@ def run_burst(
 # Main loop
 # ===========================================================================
 
-# ===========================================================================
-# Ghim (track) thanh đáp: làm mượt OBB + giữ lại khi YOLO mất detect
-# ===========================================================================
-
-TRACK_HOLD_FRAMES: int   = 45    # số frame giữ thanh khi mất detect (~1.5s @30fps)
-TRACK_EMA_ALPHA:   float = 0.35  # 0..1, càng nhỏ càng mượt (nhưng trễ hơn)
-TRACK_MATCH_FRAC:  float = 0.6   # ngưỡng ghép: khoảng cách tâm <= frac * chiều dài thanh
-
-
-class BarTracker:
-    """Ghim thanh mục tiêu qua nhiều frame.
-
-    - Ghép detection mới với track hiện tại theo khoảng cách tâm.
-    - Làm mượt 4 góc OBB bằng EMA → góc nghiêng / gợi ý xoay ổn định.
-    - Khi mất detect, giữ nguyên vị trí cuối tối đa TRACK_HOLD_FRAMES frame
-      (det có cờ "held"=True).
-    """
-
-    def __init__(self, hold: int = TRACK_HOLD_FRAMES,
-                 alpha: float = TRACK_EMA_ALPHA):
-        self.hold = hold
-        self.alpha = alpha
-        self.reset()
-
-    def reset(self) -> None:
-        self.corners: Optional[np.ndarray] = None   # (4,2) float
-        self.name = ""
-        self.conf = 0.0
-        self.misses = 0
-
-    @staticmethod
-    def _align(new: np.ndarray, ref: np.ndarray) -> np.ndarray:
-        """Xoay vòng thứ tự 4 góc của `new` cho khớp nhất với `ref`."""
-        best, best_d = new, float("inf")
-        for s in range(4):
-            cand = np.roll(new, s, axis=0)
-            d = float(np.linalg.norm(cand - ref))
-            if d < best_d:
-                best, best_d = cand, d
-        return best
-
-    def _make_det(self, held: bool) -> dict:
-        c = self.corners
-        poly = np.round(c).astype(np.int32)
-        x1, y1 = (int(v) for v in np.floor(c.min(axis=0)))
-        x2, y2 = (int(v) for v in np.ceil(c.max(axis=0)))
-        return {
-            "box":       (x1, y1, x2, y2),
-            "name":      self.name,
-            "conf":      self.conf,
-            "mask_poly": poly,
-            "axis":      bar_axis_2d((x1, y1, x2, y2), poly),
-            "held":      held,
-        }
-
-    def update(self, dets: list[dict]) -> list[dict]:
-        matched = None
-        if self.corners is not None and dets:
-            ref_c = self.corners.mean(axis=0)
-            ref_len = float(np.max(np.linalg.norm(
-                self.corners - np.roll(self.corners, 1, axis=0), axis=1)))
-            thr = max(TRACK_MATCH_FRAC * ref_len, 30.0)
-            best_d = float("inf")
-            for d in dets:
-                dist = float(np.linalg.norm(
-                    np.array(d["axis"]["center"]) - ref_c))
-                if dist < thr and dist < best_d:
-                    matched, best_d = d, dist
-
-        if matched is not None:
-            new = matched["mask_poly"].reshape(4, 2).astype(np.float64)
-            new = self._align(new, self.corners)
-            self.corners = self.alpha * new + (1.0 - self.alpha) * self.corners
-            self.name, self.conf, self.misses = matched["name"], matched["conf"], 0
-            others = [d for d in dets if d is not matched]
-            return [self._make_det(False)] + others
-
-        if self.corners is not None:
-            self.misses += 1
-            if self.misses <= self.hold:
-                return [self._make_det(True)] + dets   # ghim: giữ thanh cũ
-            self.reset()
-
-        if dets:                                        # bắt thanh mới
-            top = dets[0]
-            self.corners = top["mask_poly"].reshape(4, 2).astype(np.float64)
-            self.name, self.conf, self.misses = top["name"], top["conf"], 0
-            return [self._make_det(False)] + dets[1:]
-        return []
-
-
 def main() -> None:
     # ------------------------------------------------------------------
     # Mở camera source – Picamera2 trên Raspberry Pi 5
@@ -1339,7 +1248,6 @@ def main() -> None:
     n_det_live     = 0
     conf_thresh    = YOLO_CONF
     display: Optional[np.ndarray] = None
-    tracker = BarTracker()
 
     WIN_MAIN  = "Perch Detector  [T=Analyze  K=Continue  D=Depth  S=Save  Q=Quit]"
     WIN_DEPTH = "Depth Map"
@@ -1394,9 +1302,9 @@ def main() -> None:
                 continue
 
             left_rect = rectify_left(depth_est, fl)
-            dets = tracker.update(extract_detections(
+            dets = extract_detections(
                 yolo(left_rect, conf=conf_thresh, verbose=False)[0], yolo.names
-            ))
+            )
             n_det_live = len(dets)
 
             display = left_rect.copy()
@@ -1404,8 +1312,7 @@ def main() -> None:
                 x1, y1, x2, y2 = d["box"]
                 draw_perch_detection(
                     display, x1, y1, x2, y2,
-                    f"{'TARGET ' if j == 0 else ''}{d['name']} {d['conf']:.0%}"
-                    f"{' (HELD)' if d.get('held') else ''}",
+                    f"{'TARGET ' if j == 0 else ''}{d['name']} {d['conf']:.0%}",
                     None, None, None, None, d["mask_poly"],
                 )
 
@@ -1465,7 +1372,6 @@ def main() -> None:
                 print("[INFO] Tiếp tục quá trình tìm thanh đáp …")
             burst_result = None
             state = "SEARCHING"
-            tracker.reset()
             t_last = time.monotonic()
 
         elif key == ord("d"):           # D → toggle depth map
