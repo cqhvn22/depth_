@@ -1,15 +1,16 @@
 """Monocular-depth perch candidate detector for Raspberry Pi 5.
 
-Detection: MiDaS v2.1 Small ONNX (relative inverse depth) + geometry/profile.
+Detection: MiDaS Small relative depth + RGB/edge geometric fallback (no YOLO).
 Measurement: optional, independently calibrated stereo depth at trigger only.
 IMPORTANT: no autonomous landing decision is produced by this prototype.
 
-T=burst/verify, D=depth window, R=reset, S=save, Q/ESC=quit.
+T=burst/verify, K/R=continue, D=depth window, S=save, Q/ESC=quit.
 No YOLO/ultralytics or command line arguments required.
 """
 from __future__ import annotations
 
 import math
+import json
 import sys
 import time
 from dataclasses import dataclass
@@ -34,10 +35,9 @@ CAPTURE_WIDTH, CAPTURE_HEIGHT = 960, 540
 # Picamera2 RGB888 arrays are B,G,R (already OpenCV order); toggle only if needed.
 DIRECT_PICAM_CONVERT_RGB_TO_BGR = False
 
-# MiDaS v2.1 Small ONNX at 256x256. The upstream MiDaS transform uses RGB.
-# Some third-party exports document BGR: test the model/export if depth is odd.
+# MiDaS v2.1 Small export Heliosoph expects BGR + ImageNet normalization.
 MODEL_INPUT_SIZE = 256
-MODEL_INPUT_COLOR = "RGB"  # RGB | BGR
+MODEL_INPUT_COLOR = "BGR"  # this MiDaS-small ONNX export expects BGR
 MODEL_BACKEND = "auto"  # auto | onnxruntime | opencv
 CPU_THREADS = 3
 LIVE_INFER_EVERY = 2  # only infer on every Nth live frame; burst always infers
@@ -46,14 +46,27 @@ ANALYSIS_WIDTH = 480
 # Depth-based segmentation. Outputs are relative (NOT meters).
 TOPHAT_VERTICAL_PX = 43   # at ANALYSIS_WIDTH; suppress thick regions
 RELIEF_THRESHOLD = 0.058 # minimum local inverse-depth relief, normalized [0,1]
-MIN_BAR_LENGTH_PX = 38
+MIN_BAR_LENGTH_PX = 36
 MIN_BAR_THICK_PX = 3.0
-MAX_BAR_THICK_PX = 55.0
+MAX_BAR_THICK_PX = 95.0
 MIN_ASPECT_RATIO = 4.0
 MAX_TILT_DEG = 29.9       # strictly < 30 degrees
 MIN_CYLINDER_PROFILE = 0.008  # center of cross-section nearer than both sides
-REQUIRE_CYLINDER_PROFILE = True  # approximate only; NOT a 3D shape proof
-MAX_CANDIDATES = 12
+REQUIRE_CYLINDER_PROFILE = False  # approximate only; NOT a 3D shape proof
+MAX_CANDIDATES = 10
+# Hybrid fallback for wide dark bars with flat/weak relative depth.
+RGB_BAND_THRESHOLD = 18       # minimum morphological band intensity 0..255
+MIN_RGB_BAND_CONTRAST = 0.065 # center-vs-background contrast, 0..1
+RGB_VERTICAL_SCALES = (25, 43, 65, 89, 117)  # pixels at analysis resolution
+CAMERA_MOUNT = "forward"   # forward | down
+MAX_BAR_ANGLE_DEG = 29.9
+ANGLE_TOL_DEG = 3.0
+YAW_TOL_DEG = 3.0
+CENTER_TOL_PX = 25
+MIN_VALID_YAW_BINS = 5
+MIN_YAW_LENGTH_M = 0.08
+# Direct Picamera2 is not synchronized enough for metric; camera.py recommended.
+ALLOW_UNSYNC_STEREO_METRIC = False
 
 # Stereo is used ONLY for metric assessment (optional; needs original project).
 # Mono depth CANNOT return absolute distance or diameter.
@@ -175,6 +188,7 @@ class _Picamera2Source:
     def __init__(self):
         self.legacy = None
         self.direct = []
+        self.unsynchronized = False
         try:
             if str(HERE) not in sys.path:
                 sys.path.insert(0, str(HERE))
@@ -191,6 +205,7 @@ class _Picamera2Source:
                 raise RuntimeError("Could not start camera.py StereoCamera")
             print("[CAM] camera.py / StereoCamera")
             return
+        self.unsynchronized = True
         print("[WARN] camera.py not found; using unsynchronized direct Picamera2 capture")
         try:
             from picamera2 import Picamera2
@@ -234,6 +249,7 @@ class _Picamera2Source:
 class _OpenCVSource:
     def __init__(self, video: bool):
         self.video = video
+        self.unsynchronized = True
         self.left = cv2.VideoCapture(LEFT_VIDEO_FILE if video else LEFT_CAM_NUM)
         self.right = cv2.VideoCapture(RIGHT_VIDEO_FILE if video else RIGHT_CAM_NUM)
         if not self.left.isOpened():
@@ -278,6 +294,7 @@ class StereoMetric:
     def __init__(self):
         self.depth_est = None
         self.fx = None
+        self.last_depth_map = None
         if not USE_STEREO_FOR_METRIC:
             print("[WARN] Metric stereo disabled; no landing-feasibility verdict")
             return
@@ -298,20 +315,25 @@ class StereoMetric:
         print(f"[INFO] Stereo metric ready, fx={self.fx:.1f} px (burst only)")
 
     def process(self, left, right):
+        self.last_depth_map = None
         if self.depth_est is None or right is None:
-            return left, None
+            return _rectify_left(self,left), None
         rectified_left, _disparity, depth = self.depth_est.process(left, right)
         if depth is None:
             return rectified_left, None
         if depth.shape[:2] != rectified_left.shape[:2]:
             depth = cv2.resize(depth, rectified_left.shape[1::-1], interpolation=cv2.INTER_NEAREST)
+        self.last_depth_map = depth
         return rectified_left, depth
 
     def physical(self, depth: Optional[np.ndarray], mask: np.ndarray,
                  long_px: float, short_px: float):
         if depth is None or self.fx is None:
             return None, None, None
-        valid_mask = mask.astype(bool) & np.isfinite(depth) & (depth > 0)
+        sampling_mask = (cv2.erode(mask.astype(np.uint8),
+                         cv2.getStructuringElement(cv2.MORPH_RECT,(5,5)),
+                         iterations=1).astype(bool) if min(mask.shape)>10 else mask.astype(bool))
+        valid_mask = sampling_mask & np.isfinite(depth) & (depth > 0)
         count = int(valid_mask.sum())
         area = max(int(mask.astype(bool).sum()), 1)
         if count < MIN_VALID_STEREO_PX or count / area < MIN_STEREO_VALID_FRACTION:
@@ -328,354 +350,762 @@ class StereoMetric:
         return z, long_px * z / self.fx, short_px * z / self.fx
 
 
+
 @dataclass
 class Candidate:
+    """Image candidate; not proof of a cylinder or safe autonomous perch."""
     box: tuple[int, int, int, int]
     polygon: np.ndarray
     long_px: float
     short_px: float
-    tilt_deg: float
+    tilt_deg: float       # +: right end higher in image (same convention as YOLO file)
     aspect: float
     profile: float
     mask: np.ndarray
+    source: str = "depth"
+    score: float = 0.0
+    rgb_contrast: float = 0.0
     dist_m: Optional[float] = None
     length_m: Optional[float] = None
     width_m: Optional[float] = None
+    yaw_cmd_deg: Optional[float] = None
     verdict: Optional[bool] = None
     reason: str = ""
 
+    @property
+    def center(self) -> tuple[float, float]:
+        return (float(np.mean(self.polygon[:, 0])), float(np.mean(self.polygon[:, 1])))
 
-def _long_side_geometry(box: np.ndarray):
-    edges = np.roll(box, -1, axis=0) - box
+    @property
+    def direction(self) -> tuple[float, float]:
+        a = math.radians(self.tilt_deg)
+        return math.cos(a), -math.sin(a)
+
+
+def _long_side_geometry(corners: np.ndarray) -> tuple[float, float, float]:
+    edges = np.roll(corners, -1, axis=0) - corners
     lens = np.linalg.norm(edges, axis=1)
-    index = int(lens.argmax())
-    main = edges[index]
-    angle = math.degrees(math.atan2(float(main[1]), float(main[0])))
-    angle = (angle + 90) % 180 - 90
-    return float(lens.max()), float(lens.min()), angle
+    main = edges[int(lens.argmax())]
+    if main[0] < 0:
+        main = -main
+    angle = math.degrees(math.atan2(-float(main[1]), float(main[0])))
+    angle = (angle + 90.0) % 180.0 - 90.0
+    return float(lens.max()), float(lens.min()), float(angle)
 
 
-def _cylinder_profile(depth: np.ndarray, center: np.ndarray,
-                      long_px: float, short_px: float, tilt: float) -> float:
-    """Central convex-depth crest across narrow side (weak cylinder heuristic)."""
-    theta = math.radians(tilt)
-    u = np.array([math.cos(theta), math.sin(theta)], np.float32)
+def _sample_cross_band(image: np.ndarray, center: np.ndarray,
+                       length: float, thick: float, tilt_deg: float):
+    """Sample both shoulders + middle for RGB contrast / inverse-depth crest."""
+    a = math.radians(tilt_deg)
+    u = np.array([math.cos(a), -math.sin(a)], np.float32)
     v = np.array([-u[1], u[0]], np.float32)
-    t = np.linspace(-0.35, 0.35, 13, dtype=np.float32) * long_px
-    s = np.linspace(-0.60, 0.60, 19, dtype=np.float32) * short_px
-    coords = center[None, None, :] + t[:, None, None] * u + s[None, :, None] * v
-    grid_x = coords[:, :, 0].astype(np.float32)
-    grid_y = coords[:, :, 1].astype(np.float32)
-    samples = cv2.remap(depth, grid_x, grid_y, cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REFLECT101)
-    profile = np.median(samples, axis=0)
-    center_v = np.mean(profile[7:12])
-    upper = np.mean(profile[0:4])
-    lower = np.mean(profile[-4:])
-    # Both shoulders should be behind the crest.
-    return float(min(center_v - upper, center_v - lower))
+    t = np.linspace(-0.32, 0.32, 15, dtype=np.float32) * length
+    s = np.linspace(-0.70, 0.70, 27, dtype=np.float32) * thick
+    xy = center[None, None, :] + t[:, None, None] * u + s[None, :, None] * v
+    samples = cv2.remap(image, xy[:, :, 0].astype(np.float32),
+                        xy[:, :, 1].astype(np.float32), cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REPLICATE)
+    p = np.median(samples, axis=0)
+    inside = float(np.mean(p[11:16]))
+    sides = [float(np.mean(p[0:5])), float(np.mean(p[-5:]))]
+    return inside, sides
 
 
-def detect_horizontal_cylinders(depth: np.ndarray) -> list[Candidate]:
-    """Extract depth-relief ridges; geometry <30° and length/width >=4.
+def _depth_profile(inv_depth: np.ndarray, center: np.ndarray,
+                   length: float, thick: float, tilt_deg: float) -> float:
+    mid, sides = _sample_cross_band(inv_depth, center, length, thick, tilt_deg)
+    return min(mid - sides[0], mid - sides[1])
 
-    A depth-only candidate is NOT necessarily a real cylinder or safe perch.
-    """
-    h, w = depth.shape[:2]
-    new_w = min(ANALYSIS_WIDTH, w)
-    new_h = max(32, round(h * new_w / w))
-    inv_depth = cv2.resize(norm_rel_depth(depth), (new_w, new_h),
-                           interpolation=cv2.INTER_AREA)
-    inv_depth = cv2.GaussianBlur(inv_depth, (3, 3), 0.7)
 
-    # Vertical top-hat highlights relatively near, slender horizontal ridges.
-    top_hat = cv2.morphologyEx(
-        inv_depth, cv2.MORPH_TOPHAT,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, _odd(TOPHAT_VERTICAL_PX))),
-    )
-    background = cv2.GaussianBlur(inv_depth, (0, 0), sigmaX=12, sigmaY=12)
-    relief = np.maximum(top_hat, inv_depth - background)
-    binary = (relief >= RELIEF_THRESHOLD).astype(np.uint8) * 255
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE,
-                              cv2.getStructuringElement(cv2.MORPH_RECT, (11, 3)))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
-                              cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)))
+def _rgb_band_contrast(gray_float: np.ndarray, center: np.ndarray,
+                       length: float, thick: float, tilt_deg: float) -> float:
+    mid, sides = _sample_cross_band(gray_float, center, length, thick, tilt_deg)
+    # Positive => band is darker than BOTH sides; negative => lighter than both.
+    dark = min(s - mid for s in sides)
+    light = min(mid - s for s in sides)
+    return max(dark, light)
+
+
+def _iou(a, b) -> float:
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    overlap = max(0, x2-x1) * max(0, y2-y1)
+    aa = max(0, a[2]-a[0])*max(0, a[3]-a[1])
+    bb = max(0, b[2]-b[0])*max(0, b[3]-b[1])
+    return overlap / max(1, aa + bb - overlap)
+
+
+def _geometry_from_binary(binary: np.ndarray, source: str,
+                          depth_small: np.ndarray,
+                          gray_small: Optional[np.ndarray],
+                          out_shape: tuple[int, int],
+                          inv_affine: Optional[np.ndarray] = None) -> list[Candidate]:
+    h, w = out_shape
+    ah, aw = binary.shape
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    sx, sy = w / new_w, h / new_h
-    found: list[Candidate] = []
+    sx, sy = w/aw, h/ah
+    found = []
     for contour in contours:
-        if len(contour) < 5:
+        if len(contour) < 4 or cv2.contourArea(contour) < 45:
             continue
+        if inv_affine is not None:
+            contour=cv2.transform(contour.astype(np.float32),inv_affine)
         rect = cv2.minAreaRect(contour)
-        (cx, cy), _dims, _rect_angle = rect
         corners = cv2.boxPoints(rect)
-        long_w, short_w, tilt = _long_side_geometry(corners)
-        if (short_w < MIN_BAR_THICK_PX or short_w > MAX_BAR_THICK_PX
-                or long_w < MIN_BAR_LENGTH_PX
-                or long_w / max(short_w, 1e-4) < MIN_ASPECT_RATIO
-                or abs(tilt) >= 30.0 or abs(tilt) > MAX_TILT_DEG):
+        long_s, thick_s, tilt_s = _long_side_geometry(corners)
+        if (long_s < MIN_BAR_LENGTH_PX or not MIN_BAR_THICK_PX <= thick_s <= MAX_BAR_THICK_PX
+                or long_s / max(thick_s, 1e-6) < MIN_ASPECT_RATIO
+                or abs(tilt_s) >= 30 or abs(tilt_s) > MAX_BAR_ANGLE_DEG):
             continue
-        rectangular_area = max(float(long_w * short_w), 1.)
-        if cv2.contourArea(contour) / rectangular_area < 0.40:
+        fill = cv2.contourArea(contour) / max(1., long_s * thick_s)
+        if fill < 0.46:
             continue
-        profile = _cylinder_profile(inv_depth, np.array((cx, cy), np.float32),
-                                    long_w, short_w, tilt)
-        if REQUIRE_CYLINDER_PROFILE and profile < MIN_CYLINDER_PROFILE:
+        center = np.asarray(rect[0], np.float32)
+        profile = _depth_profile(depth_small, center, long_s, thick_s, tilt_s)
+        rgb_contrast = (_rgb_band_contrast(gray_small, center, long_s,
+                                          thick_s, tilt_s) if gray_small is not None else 0.0)
+        # Depth/visual branches validate differently: deep objects can have
+        # flat monocular depth, so RGB contrast can rescue them. RGB branch
+        # must have BOTH visible boundaries, not only one contrast edge.
+        if source == "depth":
+            if REQUIRE_CYLINDER_PROFILE and profile < MIN_CYLINDER_PROFILE:
+                continue
+            if profile < 0.003 and rgb_contrast < MIN_RGB_BAND_CONTRAST:
+                continue
+        elif rgb_contrast < MIN_RGB_BAND_CONTRAST:
             continue
-        pts = np.round(corners * np.array([sx, sy])).astype(np.int32)
-        x1 = max(0, int(pts[:, 0].min()))
-        x2 = min(w - 1, int(pts[:, 0].max()))
-        y1 = max(0, int(pts[:, 1].min()))
-        y2 = min(h - 1, int(pts[:, 1].max()))
+        pts = np.rint(corners * (sx, sy)).astype(np.int32)
+        x1 = max(0, int(np.min(pts[:, 0])))
+        y1 = max(0, int(np.min(pts[:, 1])))
+        x2 = min(w-1, int(np.max(pts[:, 0])))
+        y2 = min(h-1, int(np.max(pts[:, 1])))
         if x2 <= x1 or y2 <= y1:
             continue
-        mask = np.zeros((h, w), np.uint8)
+        long_px, thick_px, tilt = _long_side_geometry(pts.astype(np.float32))
+        if long_px/max(thick_px,1e-6) < MIN_ASPECT_RATIO or abs(tilt) >= 30.0:
+            continue
+        mask = np.zeros((h,w),np.uint8)
         cv2.fillConvexPoly(mask, pts, 1)
-        actual_long, actual_short, actual_tilt = _long_side_geometry(pts.astype(float))
-        found.append(Candidate(
-            box=(x1, y1, x2, y2), polygon=pts,
-            long_px=actual_long, short_px=actual_short,
-            tilt_deg=actual_tilt, aspect=actual_long / max(actual_short, 1e-4),
-            profile=profile, mask=mask,
-        ))
-    found.sort(key=lambda c: c.long_px * max(c.profile, 0.005), reverse=True)
-    return found[:MAX_CANDIDATES]
+        # Score is a heuristic ranking metric, NOT calibrated confidence.
+        score = ((1.15 if source.startswith('dark') else 0.0)
+                 -.12*abs(tilt_s)/30.0 + min(long_s/aw, 1.0)*2.0 +
+                 min(max(profile,0.)*4,1.) +
+                 min(max(rgb_contrast,0.)*2, 1.) +
+                 min(fill,1.0)*0.3)
+        # Long image-border stripes (floor/sky/window bars) are weaker perch
+        # evidence than fully visible tubes; do not entirely suppress them.
+        score -= .40*abs(float(center[1])-ah*.5)/max(ah*.5,1.)
+        if y2 >= h-4:score -= 1.25
+        if y1 <= 3:score -= .55
+        found.append(Candidate((x1,y1,x2,y2),pts,long_px,thick_px,
+                               tilt,long_px/max(thick_px,1e-6),profile,mask,
+                               source=source,score=score,rgb_contrast=rgb_contrast))
+    return found
 
 
-def assess(c: Candidate) -> None:
-    """Geometry candidate != confirmed landing-safe site."""
+def detect_horizontal_cylinders(relative_depth: np.ndarray,
+                                bgr: Optional[np.ndarray] = None) -> list[Candidate]:
+    """Detect long, nearly horizontal bar-shaped regions using depth + RGB.
+
+    Depth-only remains supported for regression/testing. On actual cameras,
+    provide BGR because wide dark pipes often lack mono-depth relief.
+    """
+    h,w = relative_depth.shape[:2]
+    aw = min(ANALYSIS_WIDTH,w)
+    ah = max(32,round(h*aw/w))
+    depth = cv2.resize(norm_rel_depth(relative_depth), (aw,ah), interpolation=cv2.INTER_AREA)
+    depth = cv2.GaussianBlur(depth,(3,3),0.7)
+    top_hat = cv2.morphologyEx(depth,cv2.MORPH_TOPHAT,
+                               cv2.getStructuringElement(cv2.MORPH_RECT,
+                                                         (3,_odd(TOPHAT_VERTICAL_PX))))
+    backdrop = cv2.GaussianBlur(depth, (0,0),sigmaX=12,sigmaY=12)
+    relief = np.maximum(top_hat, depth-backdrop)
+    d_binary = (relief >= RELIEF_THRESHOLD).astype(np.uint8)*255
+    d_binary = cv2.morphologyEx(d_binary,cv2.MORPH_CLOSE,
+                                cv2.getStructuringElement(cv2.MORPH_RECT,(11,3)))
+    d_binary = cv2.morphologyEx(d_binary,cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_RECT,(5,3)))
+    gray = None
+    found = []
+    if bgr is not None:
+        if bgr.shape[:2] != (h,w):
+            raise ValueError('RGB image and depth must have the same shape')
+        g = cv2.cvtColor(cv2.resize(bgr,(aw,ah),interpolation=cv2.INTER_AREA),
+                         cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(g,(3,3),0.7)
+        gray_float = gray.astype(np.float32)/255.0
+    else:
+        gray_float = None
+    found += _geometry_from_binary(d_binary,"depth",depth,gray_float,(h,w))
+    if gray is not None:
+        # Multiscale BLACKHAT + TOPHAT: recover broad flat-depth cylindrical
+        # silhouettes from paired long edges (black or pale surfaces).
+        for k in RGB_VERTICAL_SCALES:
+            if k >= ah-2:
+                continue
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(3,_odd(k)))
+            for source,operation in (("dark",cv2.MORPH_BLACKHAT),
+                                     ("light",cv2.MORPH_TOPHAT)):
+                response = cv2.morphologyEx(gray,operation,kernel)
+                binary = np.uint8(response >= RGB_BAND_THRESHOLD)*255
+                binary = cv2.morphologyEx(binary,cv2.MORPH_CLOSE,
+                         cv2.getStructuringElement(cv2.MORPH_RECT,(13,3)))
+                binary = cv2.morphologyEx(binary,cv2.MORPH_OPEN,
+                         cv2.getStructuringElement(cv2.MORPH_RECT,(7,3)))
+                found += _geometry_from_binary(binary,source,depth,gray_float,(h,w))
+        # A diagonal bar becomes fragmented with vertical black-hat alone.
+        # Rotate gray into several candidate alignments, segment the rotated
+        # bar, then transform geometry back to camera coordinates.
+        # This is a lightweight deterministic alternative to another CNN.
+        for deskew in (-25,-15,-5,5,15,25):
+            affine=cv2.getRotationMatrix2D((aw*.5,ah*.5),deskew,1.0)
+            rotated=cv2.warpAffine(gray,affine,(aw,ah),flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REFLECT101)
+            inv_affine=cv2.invertAffineTransform(affine)
+            for k in (43,83,123):
+                if k>=ah-2:continue
+                response=cv2.morphologyEx(rotated,cv2.MORPH_BLACKHAT,
+                         cv2.getStructuringElement(cv2.MORPH_RECT,(3,_odd(k))))
+                binary=np.uint8(response>=RGB_BAND_THRESHOLD)*255
+                binary=cv2.morphologyEx(binary,cv2.MORPH_CLOSE,
+                         cv2.getStructuringElement(cv2.MORPH_RECT,(13,3)))
+                binary=cv2.morphologyEx(binary,cv2.MORPH_OPEN,
+                         cv2.getStructuringElement(cv2.MORPH_RECT,(7,3)))
+                found += _geometry_from_binary(binary,'dark+angle',depth,gray_float,
+                                               (h,w),inv_affine)
+
+    found.sort(key=lambda c:c.score,reverse=True)
+    unique = []
+    for c in found:
+        duplicate = False
+        for p in unique:
+            if _iou(c.box,p.box) > .42:
+                duplicate=True
+                break
+            # Deduplicate nested bands on the same axis despite different widths.
+            cx,cy=c.center; px,py=p.center
+            if (abs(cx-px) < .13*min(c.long_px,p.long_px)
+                and abs(cy-py) < .28*max(c.short_px,p.short_px)
+                and abs(c.tilt_deg-p.tilt_deg) < 4
+                and abs(c.long_px-p.long_px)/max(c.long_px,p.long_px) < .25):
+                duplicate=True
+                break
+        if not duplicate:
+            unique.append(c)
+        if len(unique) >= MAX_CANDIDATES:
+            break
+    return unique
+
+
+def estimate_yaw_from_stereo(depth_map: Optional[np.ndarray], cand: Candidate,
+                             focal_px: Optional[float], cx_pp: Optional[float],
+                             unit: str = CALIB_UNIT) -> tuple[Optional[float],Optional[float]]:
+    """Robust yaw estimate from stereo 3D points near the bar's centerline.
+
+    Positive yaw command follows the user's YOLO file: rotate right.
+    Invalid/featureless stereo depth means None, never guessed yaw.
+    """
+    if depth_map is None or focal_px is None or cx_pp is None or focal_px <= 1:
+        return None,None
+    h,w = depth_map.shape[:2]
+    ys,xs=np.nonzero(cand.mask.astype(bool) & np.isfinite(depth_map) & (depth_map>0))
+    if xs.size < 45:
+        return None,None
+    bx,by=cand.center
+    ux,uy=cand.direction
+    tx=(xs-bx)*ux+(ys-by)*uy
+    ty=-(xs-bx)*uy+(ys-by)*ux
+    keep=(np.abs(tx)<.43*cand.long_px)&(np.abs(ty)<.29*cand.short_px)
+    xs,ys,tx=xs[keep],ys[keep],tx[keep]
+    if xs.size < 35:
+        return None,None
+    scale={"mm":1000.0,"cm":100.0,"m":1.0}[unit]
+    Z=np.asarray(depth_map[ys,xs],np.float64)/scale
+    valid=(Z >= MIN_DIST_M*.6)&(Z<=MAX_DIST_M*1.5)
+    xs,tx,Z=xs[valid],tx[valid],Z[valid]
+    if len(Z)<35:
+        return None,None
+    groups=np.linspace(float(tx.min()),float(tx.max()),13)
+    med_bins=[]
+    for i in range(12):
+        sel=(tx>=groups[i])&(tx<(groups[i+1] if i<11 else groups[i+1]+1))
+        if np.count_nonzero(sel)<4:
+            continue
+        zb=float(np.median(Z[sel]))
+        xb=float(np.median((xs[sel]-cx_pp)*Z[sel]/focal_px))
+        med_bins.append((xb,zb))
+    if len(med_bins)<MIN_VALID_YAW_BINS:
+        return None,None
+    x=np.array([p[0] for p in med_bins]); z=np.array([p[1] for p in med_bins])
+    xspan=np.percentile(x,95)-np.percentile(x,5)
+    if xspan<MIN_YAW_LENGTH_M:
+        return None,None
+    a,b=np.polyfit(x,z,1)
+    residual=np.abs(z-(a*x+b))
+    robust_thr=max(.018,2.5*float(np.median(residual)))
+    inliers=residual<=robust_thr
+    if np.count_nonzero(inliers)<MIN_VALID_YAW_BINS:
+        return None,None
+    x,z=x[inliers],z[inliers]
+    a,b=np.polyfit(x,z,1)
+    if np.median(np.abs(z-(a*x+b)))>.07 or abs(a)>2.5:
+        return None,None
+    yaw=-math.degrees(math.atan(a))
+    length=float((np.percentile(x,95)-np.percentile(x,5))*math.hypot(1,a))
+    return yaw,length
+
+
+def assess(candidate: Candidate) -> None:
+    """Evaluate *metric size*, never authorize landing or motion."""
+    c=candidate
     if c.dist_m is None or c.length_m is None or c.width_m is None:
-        c.verdict, c.reason = None, "NEED STEREO METRIC"
+        c.verdict,c.reason=None,"NEED CALIBRATED STEREO"
         return
-    reasons = []
-    if not (MIN_DIST_M <= c.dist_m <= MAX_DIST_M):
-        reasons.append("distance out of range")
-    if not (MIN_LENGTH_M <= c.length_m <= MAX_LENGTH_M):
-        reasons.append("length out of range")
-    if not (MIN_WIDTH_M <= c.width_m <= MAX_WIDTH_M):
-        reasons.append("diameter/width out of range")
-    c.verdict = len(reasons) == 0
-    c.reason = "METRIC PASS (NOT FLIGHT-CLEARED)" if not reasons else "; ".join(reasons)
+    invalid=[]
+    if not MIN_DIST_M <= c.dist_m <= MAX_DIST_M:
+        invalid.append("distance")
+    if not MIN_LENGTH_M <= c.length_m <= MAX_LENGTH_M:
+        invalid.append("length")
+    if not MIN_WIDTH_M <= c.width_m <= MAX_WIDTH_M:
+        invalid.append("diameter")
+    c.verdict=not invalid
+    c.reason=("METRIC PASS / NOT FLIGHT CLEARED" if not invalid
+              else "METRIC FAIL: " + ", ".join(invalid))
+
+
+def compute_guidance(c: Optional[Candidate], w: int, h: int,
+                     focal_px: Optional[float] = None) -> Optional[dict]:
+    if c is None:
+        return None
+    dx,dy=c.center[0]-w/2,c.center[1]-h/2
+    yaw = -c.tilt_deg if CAMERA_MOUNT=="down" else c.yaw_cmd_deg
+    centered=abs(dx)<=CENTER_TOL_PX and abs(dy)<=CENTER_TOL_PX
+    tilt_ok=abs(c.tilt_deg)<=ANGLE_TOL_DEG
+    yaw_ok=(None if yaw is None else abs(yaw)<=YAW_TOL_DEG)
+    def off(px):
+        if c.dist_m is not None and focal_px is not None and focal_px>0:
+            return f"{px:+.0f}px/{abs(px)*c.dist_m/focal_px:.2f}m"
+        return f"{px:+.0f}px"
+    lines=[]
+    if yaw is None:
+        lines.append(("Yaw: PRESS T (STEREO NEEDED)",COLOR_UNKNOWN))
+    elif yaw_ok:
+        lines.append((f"Yaw: ALIGNED ({yaw:+.1f} deg)",COLOR_OK))
+    else:
+        side="RIGHT" if yaw>0 else "LEFT"
+        lines.append((f"Yaw: ROTATE {side} {abs(yaw):.1f}deg",COLOR_UNKNOWN))
+    if CAMERA_MOUNT!="down":
+        lines.append((f"Tilt: {c.tilt_deg:+.1f}deg"+
+                      (" OK" if tilt_ok else " / ADJUST ROLL"),
+                      COLOR_OK if tilt_ok else COLOR_UNKNOWN))
+    lines.append((f"X: {off(dx)} "+("OK" if abs(dx)<=CENTER_TOL_PX else
+                                  "MOVE RIGHT" if dx>0 else "MOVE LEFT"),
+                  COLOR_OK if abs(dx)<=CENTER_TOL_PX else COLOR_UNKNOWN))
+    lines.append((f"Y: {off(dy)} "+("OK" if abs(dy)<=CENTER_TOL_PX else
+                                  ("MOVE BACK" if dy>0 else "MOVE FORWARD") if CAMERA_MOUNT=="down" else
+                                  ("MOVE DOWN" if dy>0 else "MOVE UP")),
+                  COLOR_OK if abs(dy)<=CENTER_TOL_PX else COLOR_UNKNOWN))
+    aligned=bool(centered and yaw_ok is True and
+                 (CAMERA_MOUNT=="down" or tilt_ok))
+    title=("ALIGNMENT: ALIGNED" if aligned else "ALIGNMENT: ADJUST" if yaw_ok is not None
+           else "ALIGNMENT: SEARCH / VERIFY")
+    return {"yaw":yaw,"dx":dx,"dy":dy,"tilt":c.tilt_deg,
+            "center_ok":centered,"tilt_ok":tilt_ok,"yaw_ok":yaw_ok,
+            "aligned":aligned,"lines":[(title,COLOR_OK if aligned else COLOR_UNKNOWN)]+lines}
+
+
+def _draw_dashed(img, p1, p2, color=(225,225,225), dash=12, gap=9):
+    a=np.array(p1,np.float32); b=np.array(p2,np.float32)
+    d=b-a; n=np.linalg.norm(d)
+    if n<1:return
+    u=d/n
+    for s in np.arange(0,n,dash+gap):
+        t=min(n,s+dash)
+        cv2.line(img,tuple((a+u*s).astype(int)),tuple((a+u*t).astype(int)),
+                 color,1,cv2.LINE_AA)
+
+
+def draw_guidance(img: np.ndarray, c: Optional[Candidate],
+                  guide: Optional[dict]) -> None:
+    h,w=img.shape[:2]; mid=(w//2,h//2)
+    _draw_dashed(img,(mid[0],0),(mid[0],h))
+    _draw_dashed(img,(0,mid[1]),(w,mid[1]))
+    t=CENTER_TOL_PX
+    for a in (-t,t):
+        _draw_dashed(img,(mid[0]+a,0),(mid[0]+a,h),(110,110,110),4,14)
+        _draw_dashed(img,(0,mid[1]+a),(w,mid[1]+a),(110,110,110),4,14)
+    cv2.circle(img,mid,7,(245,245,245),1,cv2.LINE_AA)
+    if c is None or guide is None:
+        return
+    bx,by=c.center; ux,uy=c.direction
+    col=COLOR_OK if guide['tilt_ok'] else (255,0,255)
+    span=max(w,h)*2
+    cv2.line(img,(round(bx-span*ux),round(by-span*uy)),
+             (round(bx+span*ux),round(by+span*uy)),col,1,cv2.LINE_AA)
+    p1=(round(bx-c.long_px*.5*ux),round(by-c.long_px*.5*uy))
+    p2=(round(bx+c.long_px*.5*ux),round(by+c.long_px*.5*uy))
+    cv2.line(img,p1,p2,col,3,cv2.LINE_AA)
+    for pt in (p1,p2): cv2.circle(img,pt,5,col,-1,cv2.LINE_AA)
+    cv2.arrowedLine(img,mid,(round(bx),round(by)),
+                    COLOR_OK if guide['center_ok'] else COLOR_UNKNOWN,2,
+                    cv2.LINE_AA,tipLength=.07)
+    if abs(c.tilt_deg)>0.2:
+        r=int(min(55,c.long_px*.2))
+        cv2.ellipse(img,(round(bx),round(by)),(r,r),0,
+                    min(0,-c.tilt_deg),max(0,-c.tilt_deg),col,2,cv2.LINE_AA)
+    cv2.putText(img,f"{c.tilt_deg:+.1f}deg",(min(w-130,round(bx)+50),
+                max(80,round(by)-12)),cv2.FONT_HERSHEY_SIMPLEX,.55,col,2,cv2.LINE_AA)
+
+
+def draw_panel(img: np.ndarray, guide: Optional[dict]):
+    lines = ([('ALIGNMENT: NO TARGET',COLOR_UNKNOWN),('Searching horizontal bar...',
+             (180,180,180))] if guide is None else guide['lines'])
+    font=cv2.FONT_HERSHEY_SIMPLEX; fs=.48
+    tw=max(cv2.getTextSize(s,font,fs,1)[0][0] for s,_ in lines)
+    h,w=img.shape[:2]
+    x0=max(4,w-tw-24)
+    y0=8
+    y1=min(h-4,20+23*len(lines))
+    shade=img.copy()
+    cv2.rectangle(shade,(x0,y0),(w-5,y1),(15,15,30),-1)
+    cv2.addWeighted(shade,.73,img,.27,0,img)
+    cv2.rectangle(img,(x0,y0),(w-5,y1),lines[0][1],1)
+    for i,(text,color) in enumerate(lines):
+        ty=y0+19+i*23
+        if ty>=h:break
+        cv2.putText(img,text,(x0+7,ty),font,fs,color,
+                    2 if i==0 else 1,cv2.LINE_AA)
+
+
+def fmt(v: Optional[float], unit="m") -> str:
+    return "N/A" if v is None else f"{v:.2f}{unit}"
+
+
+def overlay(image: np.ndarray, candidates: list[Candidate], state: str,
+            fps: float, extra: str = "", focal_px: Optional[float] = None,
+            selected: Optional[Candidate] = None) -> np.ndarray:
+    out=image.copy(); layer=out.copy()
+    for c in candidates:
+        col=COLOR_OK if c.verdict is True else COLOR_FAIL if c.verdict is False else COLOR_UNKNOWN
+        cv2.fillConvexPoly(layer,c.polygon,col)
+    cv2.addWeighted(layer,.13,out,.87,0,out)
+    for i,c in enumerate(candidates):
+        col=COLOR_OK if c.verdict is True else COLOR_FAIL if c.verdict is False else COLOR_UNKNOWN
+        thick=3 if c is selected or (selected is None and i==0) else 1
+        cv2.polylines(out,[c.polygon],True,col,thick,cv2.LINE_AA)
+        x1,y1,_,_=c.box
+        label=(("TARGET " if c is selected else f"#{i+1} ")+
+               f"{c.source} tilt={c.tilt_deg:+.1f} R={c.aspect:.1f}")
+        texty=max(82,min(out.shape[0]-110,y1-8))
+        cv2.putText(out,label,(max(5,x1),texty),cv2.FONT_HERSHEY_SIMPLEX,
+                    .49,(0,0,0),3,cv2.LINE_AA)
+        cv2.putText(out,label,(max(5,x1),texty),cv2.FONT_HERSHEY_SIMPLEX,
+                    .49,col,1,cv2.LINE_AA)
+    target = selected if selected is not None else (candidates[0] if candidates else None)
+    guide=compute_guidance(target,out.shape[1],out.shape[0],focal_px)
+    draw_guidance(out,target,guide)
+    # HUD and panel are drawn *last* to remain readable.
+    if extra:
+        bottom_h=86
+        shade=out.copy()
+        cv2.rectangle(shade,(0,out.shape[0]-bottom_h),(out.shape[1],out.shape[0]),
+                      (12,12,25),-1)
+        cv2.addWeighted(shade,.78,out,.22,0,out)
+        for j,line in enumerate(extra.split('\n')[:3]):
+            cv2.putText(out,line[:115],(10,out.shape[0]-bottom_h+24+24*j),
+                        cv2.FONT_HERSHEY_SIMPLEX,.55,(215,230,240),1,cv2.LINE_AA)
+    header=[f"{state}  FPS:{fps:.1f}  Candidates:{len(candidates)}  Mount:{CAMERA_MOUNT}",
+            "T=Analyze K/R=Continue D=Depth M=Map S=Save +/-=Tune Q=Quit",
+            "Hybrid MiDaS + RGB | NOT an autonomous landing controller"]
+    shade=out.copy(); cv2.rectangle(shade,(0,0),(out.shape[1],73),(12,12,25),-1)
+    cv2.addWeighted(shade,.72,out,.28,0,out)
+    for i,line in enumerate(header):
+        cv2.putText(out,line,(10,20+i*23),cv2.FONT_HERSHEY_SIMPLEX,
+                    .48,(225,235,230),1,cv2.LINE_AA)
+    draw_panel(out,guide)
+    return out
+
+
+class LiveTracker:
+    """Hold the same spatial bar through intermittent model frames."""
+    def __init__(self):
+        self.box=None
+        self.misses=0
+    def choose(self, dets: list[Candidate]) -> Optional[Candidate]:
+        if not dets:
+            self.misses += 1
+            if self.misses >= 4: self.box=None
+            return None
+        if self.box is None:
+            choice=dets[0]
+        else:
+            choice=max(dets,key=lambda c: _iou(c.box,self.box)+.07*c.score)
+            if _iou(choice.box,self.box)<.11 and self.misses>=2:
+                choice=dets[0]
+        self.box=choice.box;self.misses=0
+        return choice
+    def reset(self):
+        self.box=None;self.misses=0
+
+
+def _rectify_left(metric: StereoMetric, left: np.ndarray) -> np.ndarray:
+    de=metric.depth_est
+    if de is None or not hasattr(de,'left_map_x') or not hasattr(de,'left_map_y'):
+        return left
+    h,w=de.left_map_x.shape[:2]
+    if left.shape[:2]!=(h,w):
+        left=cv2.resize(left,(w,h),interpolation=cv2.INTER_LINEAR)
+    return cv2.remap(left,de.left_map_x,de.left_map_y,cv2.INTER_LINEAR)
 
 
 def process_frame(bgr: np.ndarray, model: MonoDepthONNX,
                   metric: StereoMetric, right: Optional[np.ndarray] = None,
                   do_metric: bool = False):
-    aligned, depth_metric = (metric.process(bgr, right) if do_metric
-                             else (bgr, None))
-    inv_depth = model.process(aligned)
-    found = detect_horizontal_cylinders(inv_depth)
+    rectified, metric_depth = (metric.process(bgr,right) if do_metric else
+                               (_rectify_left(metric,bgr),None))
+    mono=model.process(rectified)
+    found=detect_horizontal_cylinders(mono,rectified)
     for c in found:
-        c.dist_m, c.length_m, c.width_m = metric.physical(
-            depth_metric, c.mask, c.long_px, c.short_px)
+        c.dist_m,c.length_m,c.width_m=metric.physical(
+            metric_depth,c.mask,c.long_px,c.short_px)
+        if metric_depth is not None and metric.fx is not None:
+            cx_pp=(-float(metric.depth_est.Q[0,3])
+                   if metric.depth_est is not None else rectified.shape[1]/2)
+            yaw,length_3d=estimate_yaw_from_stereo(metric_depth,c,metric.fx,cx_pp)
+            c.yaw_cmd_deg=yaw
+            if length_3d is not None and c.length_m is not None:
+                # Model can under-estimate length when perspective yaw makes
+                # the bar short in 2D. Prefer fitted 3D value when available.
+                c.length_m=max(length_3d,c.length_m)
         assess(c)
-    return aligned, inv_depth, found
-
-
-def fmt_m(v: Optional[float]):
-    return "N/A" if v is None else f"{v:.2f}m"
-
-
-def overlay(image: np.ndarray, candidates: list[Candidate],
-            state: str, fps: float, extra: str = "") -> np.ndarray:
-    out = image.copy()
-    layer = out.copy()
-    for c in candidates:
-        color = COLOR_OK if c.verdict is True else COLOR_FAIL if c.verdict is False else COLOR_UNKNOWN
-        cv2.fillConvexPoly(layer, c.polygon, color)
-    cv2.addWeighted(layer, 0.18, out, 0.82, 0, out)
-    for i, c in enumerate(candidates):
-        color = COLOR_OK if c.verdict is True else COLOR_FAIL if c.verdict is False else COLOR_UNKNOWN
-        cv2.polylines(out, [c.polygon], True, color, 2, cv2.LINE_AA)
-        x1, y1, _, _ = c.box
-        label = f"#{i+1} tilt={c.tilt_deg:+.0f}deg  ratio={c.aspect:.1f}:1"
-        line2 = f"Z={fmt_m(c.dist_m)} L={fmt_m(c.length_m)} W={fmt_m(c.width_m)}"
-        y_text = min(out.shape[0] - 35, max(95, y1 - 27))
-        for line_idx, line in enumerate((label, line2)):
-            y = y_text + 18 * line_idx
-            cv2.putText(out, line, (max(4, x1), y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.47, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(out, line, (max(4, x1), y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.47, color, 1, cv2.LINE_AA)
-    lines = [f"{state} | FPS={fps:.1f} | cylinder-like={len(candidates)}",
-             "T Burst | D Depth | R Reset | S Save | Q Quit"]
-    if extra:
-        lines.append(extra[:110])
-    cv2.rectangle(out, (0, 0), (out.shape[1], 20 + 22 * len(lines)), (15, 15, 20), -1)
-    for i, line in enumerate(lines):
-        cv2.putText(out, line, (10, 22 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, (230, 230, 220), 1, cv2.LINE_AA)
-    return out
-
-
-def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
-    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
-    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    aa = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
-    bb = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-    return inter / max(1, aa + bb - inter)
+    return rectified,mono,found
 
 
 @dataclass
 class BurstResult:
     annotated: Optional[np.ndarray]
-    depth_color: Optional[np.ndarray]
-    detections: list[Candidate]
+    mono_color: Optional[np.ndarray]
+    stereo_color: Optional[np.ndarray]
+    candidates: list[Candidate]
     verdict: Optional[bool]
     reason: str
     frames_ok: int
     hits: int
+    yaw_cmd_deg: Optional[float]
+    dist_m: Optional[float]
+    length_m: Optional[float]
+    width_m: Optional[float]
+    tilt_deg: Optional[float]
+    raw_bgr: Optional[np.ndarray] = None
 
 
-def run_burst(source, model: MonoDepthONNX, metric: StereoMetric, fps: float) -> BurstResult:
-    tracks: list[dict] = []
-    last_bgr, last_depth, last_found = None, None, []
-    frames_ok = 0
+def _stereo_visualization(depth:Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Colorize calibrated stereo depth only, in meters and with invalid black."""
+    if depth is None:return None
+    scale={"mm":1000.0,"cm":100.0,"m":1.0}[CALIB_UNIT]
+    meters=np.asarray(depth,dtype=np.float32)/scale
+    valid=np.isfinite(meters)&(meters>0)
+    near=np.clip(meters/max(MAX_DIST_M,.001),0,1)
+    color=cv2.applyColorMap(np.uint8((1-near)*255),cv2.COLORMAP_TURBO)
+    color[~valid]=0
+    return color
+
+
+def _median(vals):
+    data=[x for x in vals if x is not None and np.isfinite(x)]
+    return float(np.median(data)) if data else None
+
+
+def run_burst(source, model: MonoDepthONNX, metric: StereoMetric,
+              fps:float, preferred_box=None) -> BurstResult:
+    tracks=[]
+    last_bgr=last_mono=last_stereo=None
+    last_dets=[]; frames_ok=0
     for frame_idx in range(N_BURST):
-        ok, left, right = source.read()
-        if not ok or left is None:
-            continue
+        ok,left,right=source.read()
+        if not ok or left is None:continue
         try:
-            bgr, mono_depth, found = process_frame(left, model, metric, right, do_metric=True)
+            if getattr(source,'unsynchronized',False) and not ALLOW_UNSYNC_STEREO_METRIC:
+                right=None
+            bgr, mono, found=process_frame(left,model,metric,right,do_metric=True)
+            last_stereo=_stereo_visualization(metric.last_depth_map)
         except Exception as exc:
-            print(f"[WARN] burst frame {frame_idx+1}: {exc}")
+            print(f"[WARN] burst {frame_idx+1}: {exc}")
             continue
-        frames_ok += 1
-        last_bgr, last_depth, last_found = bgr, mono_depth, found
-        used_track_indices = set()
-        for cand in found:
-            available = [(ix, _iou(track["last_box"], cand.box))
-                         for ix, track in enumerate(tracks)
-                         if ix not in used_track_indices and track["last_frame"] >= frame_idx - 2]
-            ix, score = max(available, key=lambda x: x[1], default=(-1, 0))
-            if score < 0.20:
-                tracks.append({"members": [cand], "last_box": cand.box,
-                               "last_frame": frame_idx, "hits": 1})
-                used_track_indices.add(len(tracks)-1)
+        frames_ok+=1
+        last_bgr,last_mono,last_dets=bgr,mono,found
+        used=set()
+        for c in found:
+            scores=[(i,_iou(tr['box'],c.box)) for i,tr in enumerate(tracks)
+                    if i not in used and tr['last']>=frame_idx-2]
+            ix,overlap=max(scores,key=lambda p:p[1],default=(-1,0.))
+            if overlap<.20:
+                ix=len(tracks)
+                tracks.append({'members':[c],'box':c.box,'last':frame_idx})
             else:
-                tr = tracks[ix]
-                tr["members"].append(cand)
-                tr["last_box"], tr["last_frame"] = cand.box, frame_idx
-                tr["hits"] += 1
-                used_track_indices.add(ix)
-        print(f"[BURST] {frame_idx+1}/{N_BURST}: {len(found)} geometry candidates")
-
+                tracks[ix]['members'].append(c)
+                tracks[ix]['box']=c.box
+                tracks[ix]['last']=frame_idx
+            used.add(ix)
+        print(f"[BURST] {frame_idx+1}/{N_BURST}: {len(found)} candidates")
     if last_bgr is None:
-        return BurstResult(None, None, [], None, "NO FRAMES", 0, 0)
-    required = max(2, math.ceil(frames_ok * MIN_BURST_PRESENCE))
-    tracks.sort(key=lambda tr: (tr["hits"], np.mean([c.profile for c in tr["members"]])),
-                reverse=True)
-    winner = tracks[0] if tracks else None
-    verdict: Optional[bool] = None
-    hits = winner["hits"] if winner else 0
-    if winner is None:
-        reason = "NO CYLINDER-LIKE BAR"
-    elif hits < required:
-        reason = f"UNSTABLE SHAPE ({hits}/{frames_ok}, need {required})"
+        return BurstResult(None,None,None,[],None,"NO FRAMES",0,0,None,None,None,None,None)
+    # If a target was highlighted in LIVE, prefer its spatial identity.
+    if preferred_box is not None:
+        tracks.sort(key=lambda t:(int(_iou(t['box'],preferred_box)>.20),
+                                  _iou(t['box'],preferred_box),len(t['members'])),reverse=True)
     else:
-        measured = [c for c in winner["members"] if c.dist_m is not None]
-        if len(measured) < required:
-            reason = f"NEED RELIABLE STEREO ({len(measured)}/{frames_ok})"
+        tracks.sort(key=lambda t:(len(t['members']),
+                                  np.mean([c.score for c in t['members']])),reverse=True)
+    winner=tracks[0] if tracks else None
+    hits=len(winner['members']) if winner else 0
+    required=max(2,math.ceil(frames_ok*MIN_BURST_PRESENCE))
+    yaw=dist=length=width=tilt=None
+    verdict=None
+    if winner is None: reason="NO BAR-LIKE CANDIDATE"
+    elif hits<required: reason=f"UNSTABLE DETECTION {hits}/{frames_ok} (need {required})"
+    else:
+        members=winner['members']
+        tilt=_median([c.tilt_deg for c in members])
+        valid=[c for c in members if c.dist_m is not None]
+        if len(valid)<required:
+            reason=f"NEED STEREO METRIC {len(valid)}/{frames_ok}; NOT APPROVED"
         else:
-            # Aggregate only ONE spatially tracked bar, never all boxes together.
-            exemplar = measured[-1]
-            med = Candidate(exemplar.box, exemplar.polygon, exemplar.long_px,
-                            exemplar.short_px, exemplar.tilt_deg, exemplar.aspect,
-                            exemplar.profile, exemplar.mask,
-                            dist_m=float(np.median([c.dist_m for c in measured])),
-                            length_m=float(np.median([c.length_m for c in measured])),
-                            width_m=float(np.median([c.width_m for c in measured])))
-            assess(med)
-            verdict, reason = med.verdict, med.reason
-    annotated = overlay(last_bgr, last_found, "BURST RESULT", fps,
-                        f"{reason} | tracked={hits}/{frames_ok}")
-    depth_color = relative_depth_color(last_depth)
-    for cand in last_found:
-        color = COLOR_OK if cand.verdict is True else COLOR_FAIL if cand.verdict is False else COLOR_UNKNOWN
-        cv2.polylines(depth_color, [cand.polygon], True, color, 2, cv2.LINE_AA)
-    print(f"[RESULT] {reason} | frames={frames_ok} | track hits={hits}")
-    return BurstResult(annotated, depth_color, last_found, verdict,
-                       reason, frames_ok, hits)
+            dist=_median([c.dist_m for c in valid]); length=_median([c.length_m for c in valid])
+            width=_median([c.width_m for c in valid]); yaw=_median([c.yaw_cmd_deg for c in valid])
+            if CAMERA_MOUNT=="down" and tilt is not None: yaw=-tilt
+            sample=valid[-1]
+            sample.dist_m,sample.length_m,sample.width_m=dist,length,width
+            sample.yaw_cmd_deg=yaw
+            assess(sample)
+            verdict,reason=sample.verdict,sample.reason
+            if yaw is None:reason += " | YAW N/A"
+    best=None
+    if winner:
+        last_best=[c for c in last_dets if _iou(c.box,winner['box'])>.15]
+        best=last_best[0] if last_best else winner['members'][-1]
+    if best is not None:
+        # Present burst aggregates, not one arbitrarily noisy frame.
+        best.dist_m,best.length_m,best.width_m=dist,length,width
+        best.yaw_cmd_deg=yaw
+        best.verdict=verdict
+        best.reason=reason
+    more=(f"{reason}\nZ={fmt(dist)} L={fmt(length)} W={fmt(width)} "
+          f"Yaw={fmt(yaw,'deg')} Tilt={fmt(tilt,'deg')}\n"
+          f"Tracked {hits}/{frames_ok}; verify unobstructed span before any maneuver")
+    annotated=overlay(last_bgr,last_dets,'BURST RESULT',fps,more,metric.fx,best)
+    mono_color=relative_depth_color(last_mono)
+    for c in last_dets:
+        cv2.polylines(mono_color,[c.polygon],True,
+                      COLOR_OK if c is best and verdict else COLOR_UNKNOWN,2)
+    print(f"[RESULT] {reason}; tracked={hits}/{frames_ok}; yaw={yaw}")
+    return BurstResult(annotated,mono_color,last_stereo,last_dets,verdict,reason,
+                       frames_ok,hits,yaw,dist,length,width,tilt,last_bgr)
+
+
+def _snapshot(folder:Path,tag:str,image:np.ndarray,mono:Optional[np.ndarray],
+              result:Optional[BurstResult],raw:Optional[np.ndarray]=None):
+    folder.mkdir(parents=True,exist_ok=True)
+    cv2.imwrite(str(folder/f"{tag}_annotated.png"),image)
+    if raw is not None:cv2.imwrite(str(folder/f"{tag}_camera.png"),raw)
+    if mono is not None:cv2.imwrite(str(folder/f"{tag}_mono_depth.png"),mono)
+    if result is not None:
+        if result.stereo_color is not None:
+            cv2.imwrite(str(folder/f"{tag}_stereo_metric.png"),result.stereo_color)
+        info={"verdict_metric":result.verdict,"reason":result.reason,
+              "frames":result.frames_ok,"track_hits":result.hits,
+              "distance_m":result.dist_m,"length_m":result.length_m,
+              "width_m":result.width_m,"yaw_cmd_deg":result.yaw_cmd_deg,
+              "image_tilt_deg":result.tilt_deg,
+              "warning":"Relative mono depth is NOT metric; no flight authorization"}
+        (folder/f"{tag}_result.json").write_text(json.dumps(info,indent=2),encoding='utf-8')
+    print(f"[INFO] Saved snapshot {tag} to {folder}")
 
 
 def main():
+    global RGB_BAND_THRESHOLD
     cv2.setNumThreads(CPU_THREADS)
-    model = MonoDepthONNX(MODEL_FILE)
-    metric = StereoMetric()
-    source = None
-    win, dwin = "Perch Detector [MiDaS Small]", "Monocular Relative Depth (NOT meters)"
-    show_depth = SHOW_DEPTH_ON_START
-    result: Optional[BurstResult] = None
-    cached_depth = None
-    cached_found = []
-    frame_idx = 0
-    last_time = time.monotonic()
-    fps = 0.0
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, WINDOW_WIDTH, WINDOW_HEIGHT)
-    depth_window_open = False
+    model=MonoDepthONNX(MODEL_FILE)
+    metric=StereoMetric()
+    source=None
+    win="Perch Detector [Hybrid MiDaS + RGB]"
+    depth_win="Monocular Relative Depth (NOT meters)"
+    show_depth=SHOW_DEPTH_ON_START
+    stereo_window_mode=False
+    depth_open=False
+    result:Optional[BurstResult]=None
+    cached_mono=None;cached_dets=[];cached_rect=None
+    tracker=LiveTracker();target=None
+    frame_no=0;fps=0.0;last=time.monotonic()
+    cv2.namedWindow(win,cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win,WINDOW_WIDTH,WINDOW_HEIGHT)
     try:
-        source = make_camera()
+        source=make_camera()
+        print('[INFO] SEARCHING: MiDaS + RGB fallback; metric stereo only in T-burst')
+        print('[INFO] T analyze | K/R continue | D depth | S snapshot | +/- sensitivity | Q quit')
         while True:
-            ok, left, _right = source.read()
-            if not ok or left is None:
-                if cv2.waitKey(20) & 0xFF in (ord("q"), 27):
-                    break
-                continue
-            frame_idx += 1
-            now = time.monotonic()
-            inst = 1.0 / max(1e-5, now - last_time)
-            fps = 0.8 * fps + 0.2 * inst if fps else inst
-            last_time = now
-
-            # No stereo or metric computation in live preview.
-            if result is None and (cached_depth is None or frame_idx % LIVE_INFER_EVERY == 0):
-                bgr, cached_depth, cached_found = process_frame(left, model, metric)
             if result is not None:
-                display = result.annotated
-                depth_view = result.depth_color
+                display=result.annotated.copy() if result.annotated is not None else np.zeros((480,640,3),np.uint8)
+                depth_view=(result.stereo_color if stereo_window_mode and
+                            result.stereo_color is not None else result.mono_color)
             else:
-                display = overlay(left, cached_found, "LIVE / GEOMETRY ONLY", fps,
-                                  "Yellow = unverified; press T for metric stereo check")
-                depth_view = relative_depth_color(cached_depth)
-            cv2.imshow(win, display)
-            if show_depth:
-                if not depth_window_open:
-                    cv2.namedWindow(dwin, cv2.WINDOW_NORMAL)
-                    depth_window_open = True
-                cv2.imshow(dwin, depth_view)
-            elif depth_window_open:
-                cv2.destroyWindow(dwin)
-                depth_window_open = False
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            if key == ord("t"):
-                print("[INFO] Burst: geometry segmentation + calibrated stereo")
-                result = run_burst(source, model, metric, fps)
-            elif key == ord("d"):
-                show_depth = not show_depth
-            elif key == ord("r"):
-                result = None
-                cached_depth = None
-                cached_found = []
-            elif key == ord("s"):
-                folder = Path(SNAPSHOT_DIR)
-                folder.mkdir(parents=True, exist_ok=True)
-                name = time.strftime("%Y%m%d_%H%M%S")
-                cv2.imwrite(str(folder / (name + "_annotated.png")), display)
-                cv2.imwrite(str(folder / (name + "_relative_depth.png")), depth_view)
-                # 16-bit normalized visualization, still NOT metric.
-                if result is None and cached_depth is not None:
-                    cv2.imwrite(str(folder / (name + "_relative_depth16.png")),
-                                (norm_rel_depth(cached_depth)*65535).astype(np.uint16))
-                print(f"[INFO] Saved {name} to {folder}")
+                ok,left,right=source.read()
+                if not ok or left is None:
+                    if cv2.waitKey(15)&0xff in (ord('q'),27):break
+                    continue
+                frame_no+=1
+                now=time.monotonic();dt=max(1e-5,now-last);last=now
+                fps=(.85*fps+.15/dt) if fps else (1/dt)
+                if cached_mono is None or frame_no%LIVE_INFER_EVERY==0:
+                    cached_rect,cached_mono,cached_dets=process_frame(left,model,metric)
+                    target=tracker.choose(cached_dets)
+                # Use cached rectified image if inference skipped? Display new
+                # rectified camera frame with last detections for lower latency.
+                displayed=_rectify_left(metric,left)
+                display=overlay(displayed,cached_dets,'SEARCHING',fps,
+                                '',metric.fx,target)
+                depth_view=relative_depth_color(cached_mono)
+            cv2.imshow(win,display)
+            if show_depth and depth_view is not None:
+                if not depth_open:
+                    cv2.namedWindow(depth_win,cv2.WINDOW_NORMAL); depth_open=True
+                cv2.imshow(depth_win,depth_view)
+            elif depth_open:
+                cv2.destroyWindow(depth_win);depth_open=False
+            key=cv2.waitKey(30 if result is not None else 1)&0xff
+            if key in (ord('q'),27):break
+            if key==ord('t'):
+                busy=display.copy()
+                cv2.putText(busy,'ANALYZING stereo / yaw ...',(20,busy.shape[0]//2),
+                            cv2.FONT_HERSHEY_SIMPLEX,.9,COLOR_UNKNOWN,2,cv2.LINE_AA)
+                cv2.imshow(win,busy);cv2.waitKey(1)
+                result=run_burst(source,model,metric,fps,
+                                 target.box if target is not None else None)
+            elif key in (ord('r'),ord('k')):
+                stereo_window_mode=False
+                result=None;cached_mono=None;cached_dets=[];target=None
+                tracker.reset();last=time.monotonic()
+            elif key==ord('d'):
+                show_depth=not show_depth
+            elif key==ord('m'):
+                stereo_window_mode=not stereo_window_mode
+                print(f'[INFO] Depth view: {"stereo meters" if stereo_window_mode else "monocular relative"}')
+            elif key in (ord('+'),ord('=')):
+                RGB_BAND_THRESHOLD=max(5,RGB_BAND_THRESHOLD-3)
+                print(f'[TUNING] RGB_BAND_THRESHOLD={RGB_BAND_THRESHOLD} (more sensitive)')
+                cached_mono=None
+            elif key==ord('-'):
+                RGB_BAND_THRESHOLD=min(70,RGB_BAND_THRESHOLD+3)
+                print(f'[TUNING] RGB_BAND_THRESHOLD={RGB_BAND_THRESHOLD} (less sensitive)')
+                cached_mono=None
+            elif key==ord('s'):
+                raw=(result.raw_bgr if result is not None else displayed)
+                _snapshot(Path(SNAPSHOT_DIR),time.strftime('%Y%m%d_%H%M%S'),
+                          display,depth_view,result,raw)
     finally:
-        if source is not None:
-            source.release()
+        if source is not None:source.release()
         cv2.destroyAllWindows()
 
 
-if __name__ == "__main__":
+if __name__=='__main__':
     main()
