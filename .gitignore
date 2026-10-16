@@ -1,0 +1,28 @@
+# Local Python environments and caches
+.venv/
+.venv-*/
+.ultralytics/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+
+# Temporary Git publishing checkouts
+.github-publish*/
+
+# Generated diagnostic images, snapshots and local export intermediates
+Python/perch_video_check/
+Python/perch_video_check.mp4
+Python/perch_video_source_preview.jpg
+Python/perch_snapshots/
+Python/perch_video_snapshots/
+models/.perch_export_*/
+models/benchmark_windows_smoke.json
+*.o
+
+# Files larger than 20,000,000 bytes, excluded from this publication
+/Python/l1.mp4
+/Python/r1.mp4
+/Calibration/recording/l1.mp4
+/Calibration/recording/r1.mp4

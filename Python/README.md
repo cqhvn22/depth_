@@ -1,5 +1,32 @@
 # Lenna Stereo Camera – Raspberry Pi 5 Setup
 
+## Perch detector camera tối ưu cho Raspberry Pi 5
+
+[`perch_detector.py`](perch_detector.py) dùng NCNN FP16, không cần PyTorch trên Pi.
+Giữ hai mắt, hướng dẫn căn góc và T đo burst từ bản video. Model đã xuất trong
+`models/perch_pi5_640_fp16_ncnn_model/` và profile chi tiết 960.
+
+```bash
+bash Python/setup_perch_pi5.sh
+.venv-pi5/bin/python Python/perch_detector.py
+```
+
+Chạy từ gốc dự án trên Pi OS 64-bit. Xem
+[hướng dẫn Pi 5 và model tối ưu](perch_detector_pi5_README.md).
+
+## Chạy perch segmentation từ hai video trên PC
+
+Dùng [`perch_video_seg.py`](perch_video_seg.py) với `l1.mp4`, `r1.mp4` và mô hình
+`best-seg.pt` ở thư mục gốc, không cần Picamera2. Từ thư mục gốc dự án:
+
+```powershell
+.\.venv\Scripts\python.exe Python\perch_video_seg.py
+```
+
+Xem [hướng dẫn cài đặt, tham số và điều khiển](perch_video_seg_README.md).
+Giao diện hiển thị cả hai mắt, depth và gợi ý căn góc. Bấm **T** để đo burst
+7 cặp frame rồi đánh giá khả năng đáp; **R** trở lại live, **B** tua lại video.
+
 Hướng dẫn này giúp bạn chạy toàn bộ pipeline stereo camera trên **Raspberry Pi 5** với **picamera2**.
 
 ---

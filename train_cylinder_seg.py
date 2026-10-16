@@ -8,7 +8,7 @@ with a built-in test/inference mode that renders true segmentation borders
 
 Dataset source:
     Roboflow – arturo-perez-fzrw0 / cylinder-eiuoi
-    API key : HwZYq22onvjG9WU7kJSZ
+    API key : set ROBOFLOW_API_KEY in your environment
 
 Usage
 -----
@@ -56,7 +56,7 @@ import numpy as np
 # Constants
 # ---------------------------------------------------------------------------
 
-ROBOFLOW_API_KEY = "HwZYq22onvjG9WU7kJSZ"
+ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
 ROBOFLOW_WORKSPACE = "arturo-perez-fzrw0"
 ROBOFLOW_PROJECT = "cylinder-eiuoi"
 ROBOFLOW_VERSION = 1          # Change if the dataset has multiple versions
@@ -99,6 +99,8 @@ def download_dataset(dest_dir: str = "cylinder_dataset") -> str:
             "  Install with:  pip install roboflow"
         )
 
+    if not ROBOFLOW_API_KEY:
+        raise RuntimeError("Set ROBOFLOW_API_KEY in your environment before downloading the dataset.")
     rf = Roboflow(api_key=ROBOFLOW_API_KEY)
     project = rf.workspace(ROBOFLOW_WORKSPACE).project(ROBOFLOW_PROJECT)
     version = project.version(ROBOFLOW_VERSION)

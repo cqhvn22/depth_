@@ -1,0 +1,559 @@
+{
+  "host": "Windows-11-10.0.26200-SP0",
+  "pi_hardware_tested": false,
+  "samples": 28,
+  "note": "Mask agreement on provided video samples, not mAP/IoU against ground-truth labels.",
+  "summary": {
+    "vs_pytorch": {
+      "count_mismatches": 0,
+      "matched_masks": 28,
+      "minimum_iou": 0.9985129106394485,
+      "mean_iou": 0.9998729842146731
+    },
+    "vs_ultralytics_ncnn": {
+      "count_mismatches": 0,
+      "matched_masks": 28,
+      "minimum_iou": 1.0,
+      "mean_iou": 1.0
+    }
+  },
+  "model_bytes": {
+    "perch_pi5_640_fp16_ncnn_model": 6610478,
+    "perch_pi5_640_fp32_ncnn_model": 13115183,
+    "perch_pi5_960_fp16_ncnn_model": 6678526
+  },
+  "frames": [
+    {
+      "profile": 640,
+      "eye": "l",
+      "frame": 0,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "l",
+      "frame": 187,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9998879489047006
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "l",
+      "frame": 350,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9998343626511441
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "l",
+      "frame": 650,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9999715529257815
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "l",
+      "frame": 956,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9996456806253737
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "l",
+      "frame": 1200,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9995266496260532
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "l",
+      "frame": 1400,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.999738425320429
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "r",
+      "frame": 0,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9999340195302191
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "r",
+      "frame": 187,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9999242902208202
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "r",
+      "frame": 350,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "r",
+      "frame": 650,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "r",
+      "frame": 956,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "r",
+      "frame": 1200,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.999955450617009
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 640,
+      "eye": "r",
+      "frame": 1400,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "l",
+      "frame": 0,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "l",
+      "frame": 187,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "l",
+      "frame": 350,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9998533688506561
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "l",
+      "frame": 650,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9999713113578335
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "l",
+      "frame": 956,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9999321650650085
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "l",
+      "frame": 1200,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "l",
+      "frame": 1400,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9998241294407316
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "r",
+      "frame": 0,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "r",
+      "frame": 187,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "r",
+      "frame": 350,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "r",
+      "frame": 650,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9985129106394485
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "r",
+      "frame": 956,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9999769085115227
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "r",
+      "frame": 1200,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          0.9999543837241127
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    },
+    {
+      "profile": 960,
+      "eye": "r",
+      "frame": 1400,
+      "vs_pytorch": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      },
+      "vs_ultralytics_ncnn": {
+        "count_native": 1,
+        "count_reference": 1,
+        "ious": [
+          1.0
+        ]
+      }
+    }
+  ]
+}

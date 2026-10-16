@@ -1,0 +1,5 @@
+# WLS stereo matching needs the contrib build of OpenCV.
+numpy>=1.26,<3
+ultralytics>=8.3,<9
+opencv-python>=4.10,<5
+opencv-contrib-python>=4.10,<5

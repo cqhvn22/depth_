@@ -1,0 +1,33 @@
+{
+  "source_weights": "best-seg.pt",
+  "source_sha256": "d92f30f7ce26e7943f7bb18ce9f3c437c53c465bde3704940c26a07a9a8bbc07",
+  "architecture": "yolov8n-seg",
+  "task": "segment",
+  "format": "ncnn",
+  "weight_precision": "fp16",
+  "input_shape": [
+    1,
+    3,
+    384,
+    640
+  ],
+  "ultralytics": "8.4.178",
+  "classes": {
+    "0": "Perch"
+  },
+  "files": {
+    "model.ncnn.param": {
+      "bytes": 19047,
+      "sha256": "b2cd821ecac2815acb2ea4716fb6b90b0b2d2112271fea69e8132df39fdf24f8"
+    },
+    "model.ncnn.bin": {
+      "bytes": 6589120,
+      "sha256": "8f741d17330f972be3fabecc2eb393a3861311925f0583e9e98da5d4a8be5fba"
+    },
+    "metadata.yaml": {
+      "bytes": 466,
+      "sha256": "8e98b870d55d95bdbc8dd1617fd7c63d861cd6626af625a2fefef998775c81a1"
+    }
+  },
+  "note": "FP16 weight storage. Measure ARM inference throughput on the actual Pi 5."
+}

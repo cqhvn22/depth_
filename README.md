@@ -1,5 +1,24 @@
 # Lenna Stereo Camera
 
+## Raspberry Pi 5 perch detection
+
+The Raspberry Pi 5 camera entry point is `Python/perch_detector.py`. It uses
+the trained YOLOv8n-seg model exported to NCNN FP16, without PyTorch on the Pi.
+The display includes both eyes, depth, alignment guidance, and a **T**-triggered
+seven-pair landing assessment. Stereo depth uses the reference
+`Calibration/video_depth_estimation.py` unchanged.
+
+See [Pi 5 installation and model profiles](Python/perch_detector_pi5_README.md),
+or download the ready-to-copy [Pi 5 deployment package](perch_pi5_deploy.zip).
+
+```bash
+bash Python/setup_perch_pi5.sh
+.venv-pi5/bin/python Python/perch_detector.py
+```
+
+The original stereo videos larger than 20 MB are omitted. To test the video
+entry point, place your local `l1.mp4` and `r1.mp4` in `Python/`.
+
 ## Overview
 
 This repository contains the full software stack for running a dual **IMX219-83 stereo camera module** on an **NVIDIA Jetson Orin Nano**. It covers everything from raw dual-CSI capture to stereo calibration, disparity/depth estimation, IMU (ICM-20948) integration, and ROS 2 (Humble) nodes for publishing synchronized stereo images, camera info, IMU data, and computed depth.

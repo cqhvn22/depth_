@@ -1,0 +1,7 @@
+*.sh text eol=lf
+*.pt -text
+*.bin -text
+*.npz -text
+*.zip -text
+models/**/metadata.yaml -text
+models/**/manifest.json -text
