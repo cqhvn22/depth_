@@ -270,6 +270,7 @@ class StereoGeometryTests(unittest.TestCase):
                                 frames.append(frame)
                             observed = actual.process(*frames)
                             expected = reference.process(*frames)
+                            np.testing.assert_array_equal(actual.rectify_left(frames[0]), observed[0])
                             for result, target in zip(observed, expected):
                                 self.assertEqual(result.dtype, target.dtype)
                                 np.testing.assert_array_equal(result, target)

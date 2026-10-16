@@ -5,6 +5,7 @@
 [`perch_detector.py`](perch_detector.py) dùng NCNN FP16, không cần PyTorch trên Pi.
 Giữ hai mắt, hướng dẫn căn góc và T đo burst từ bản video. Model đã xuất trong
 `models/perch_pi5_640_fp16_ncnn_model/` và profile chi tiết 960.
+LIVE chỉ segmentation/căn góc; depth SGBM/WLS chỉ chạy trong burst sau khi bấm T.
 
 ```bash
 bash Python/setup_perch_pi5.sh

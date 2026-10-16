@@ -1,14 +1,22 @@
 """Pi camera source and lightweight NCNN postprocessing tests; no Pi/Torch needed."""
 from pathlib import Path
+import contextlib
+import io
+import json
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
+import cv2
 import numpy as np
 
 from perch_detector import PicameraPairSource, build_parser
-from perch_ncnn import class_nms, letterbox, NCNNSegmenter
+from perch_ncnn import ArrayBoxes, ArrayTensor, class_nms, letterbox, NCNNSegmenter
+from perch_video_seg import (MaskTracks, PerchWorkflow, SegmentDepth,
+                             process_stereo_pair, refresh_view, save_current)
 
 
 class FakeCamera:
@@ -67,6 +75,79 @@ class PiCameraTests(unittest.TestCase):
                 source.read()
         finally:
             source.release()
+
+
+class TriggerDepthTests(unittest.TestCase):
+    def test_stereo_work_only_runs_in_trigger_burst_and_reset_clears_depth(self):
+        """Exercise the pipeline with real SGBM/WLS and deterministic masks."""
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            yy, xx = np.indices((160, 320), dtype=np.float32)
+            q = np.array([[1, 0, 0, -160], [0, 1, 0, -80],
+                          [0, 0, 0, 200], [0, 0, 1 / 60, 0]], np.float64)
+            calib = directory / 'calib.npz'
+            np.savez(calib, left_map_x=xx, left_map_y=yy,
+                     right_map_x=xx, right_map_y=yy, Q=q)
+            args = build_parser().parse_args(['--calib', str(calib)])
+            args.imgsz, args.device = 640, 'cpu'
+            with contextlib.redirect_stdout(io.StringIO()):
+                estimator = SegmentDepth(args)
+            left = np.random.default_rng(42).integers(0, 256, (160, 320, 3), np.uint8)
+            right = np.zeros_like(left)
+            right[:, :-20] = left[:, 20:]
+            mask = np.zeros((1, 160, 320), np.uint8)
+            mask[:, 70:90, 160:280] = 1
+            prediction = SimpleNamespace(
+                boxes=ArrayBoxes(np.array([[160, 70, 280, 90, .9, 0]], np.float32)),
+                masks=SimpleNamespace(data=ArrayTensor(mask)))
+            model = SimpleNamespace(names={0: 'Perch'}, predict=Mock(return_value=[prediction]))
+            tracks, workflow = MaskTracks(), PerchWorkflow()
+            source = SimpleNamespace(total='LIVE')
+            compute = Mock(wraps=estimator.matcher.compute)
+            compute_right = Mock(wraps=estimator.right_matcher.compute)
+            filtering = Mock(wraps=estimator.wls_filter.filter)
+            estimator.matcher = SimpleNamespace(compute=compute)
+            estimator.right_matcher = SimpleNamespace(compute=compute_right)
+            estimator.wls_filter = SimpleNamespace(filter=filtering)
+            with patch('perch_video_seg.cv2.reprojectImageTo3D', wraps=cv2.reprojectImageTo3D) as reproject:
+                for index in range(3):
+                    live = process_stereo_pair(model, estimator, tracks, workflow, args, index, left, right)
+                    self.assertIsNone(live['depth'])
+                    self.assertIsNone(live['depth_color'])
+                    self.assertTrue(live['detections'])
+                    self.assertTrue(live['right_detections'])
+                    self.assertIsNone(live['detections'][0]['measurement'].values())
+                for operation in (compute, compute_right, filtering, reproject):
+                    operation.assert_not_called()
+                self.assertTrue(workflow.trigger())
+                tracks.reset_measurements()
+                for index in range(3, 10):
+                    result = process_stereo_pair(model, estimator, tracks, workflow, args, index, left, right)
+                    self.assertIsNotNone(result['depth'])
+                self.assertEqual(workflow.state, 'RESULT')
+                self.assertTrue(workflow.paused)
+                self.assertEqual(workflow.result['valid_frames'], 7)
+                self.assertTrue(workflow.result['verdict'])
+                for visible in (True, False, True):
+                    refresh_view(result, workflow, args, source, visible)
+                self.assertTrue(result['summary']['depth_computed'])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    save_current(directory / 'result', result)
+                stored = next((directory / 'result').glob('*_depth_m.npy'))
+                np.testing.assert_array_equal(np.load(stored, allow_pickle=False), result['depth'])
+                workflow.reset()
+                tracks.reset_measurements()
+                live = process_stereo_pair(model, estimator, tracks, workflow, args, 10, left, right)
+                refresh_view(live, workflow, args, source, True)
+                self.assertIsNone(live['depth'])
+                self.assertFalse(live['summary']['depth_computed'])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    save_current(directory / 'live', live)
+                self.assertEqual(list((directory / 'live').glob('*_depth_m.npy')), [])
+                summary = json.loads(next((directory / 'live').glob('*.json')).read_text())
+                self.assertFalse(summary['workflow']['depth_computed'])
+                for operation in (compute, compute_right, filtering, reproject):
+                    self.assertEqual(operation.call_count, 7)
 
 
 class LightweightBackendTests(unittest.TestCase):

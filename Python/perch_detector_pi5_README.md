@@ -62,8 +62,13 @@ flip/rotate mới mà chưa hiệu chỉnh lại.
 | S | Lưu ảnh hai mắt, màn hình 4 ô, mask trái, depth mét và JSON kết quả |
 | Q / Esc | Thoát và giải phóng camera |
 
-LIVE chỉ segmentation/căn góc. Kích thước/khoảng cách dùng để kết luận chỉ tính
-trong burst sau T, ít nhất 3 cặp hợp lệ. Hướng dẫn là độ nghiêng và vị trí thanh
+LIVE chỉ segmentation/căn góc và rectify hai ảnh; **không chạy SGBM, WLS hoặc
+reproject depth** để tăng FPS. Chỉ sau khi bấm T mới tính depth theo thuật toán
+tham chiếu trong 7 cặp mới, rồi dừng tính khi giữ RESULT. R quay về LIVE và tắt
+depth; ô depth báo `DEPTH IDLE`. D chỉ ẩn/hiện ô depth, không bật tính toán.
+Snapshot LIVE không có file depth mét `.npy`; JSON ghi `depth_computed=false`.
+Kích thước/khoảng cách dùng để kết luận chỉ tính trong burst sau T, ít nhất
+3 cặp hợp lệ. Hướng dẫn là độ nghiêng và vị trí thanh
 trong ảnh 2D, không phải ước lượng đầy đủ tư thế 3D hoặc lệnh điều khiển drone.
 Ngưỡng vẫn là khoảng cách 0.20–5.00 m, dài 0.10–2.00 m, rộng 0.02–0.20 m.
 
@@ -142,8 +147,10 @@ Kiểm tra pipeline camera không mở cửa sổ, tự trigger sau 10 cặp đ�
 
 ## Kiểm tra đã thực hiện trên Windows
 
-- 32 test đạt, gồm camera giả lập: sequence trùng, bỏ cặp trước T, timeout,
+- 33 test đạt, gồm camera giả lập: sequence trùng, bỏ cặp trước T, timeout,
   giải phóng camera và thứ tự màu RGB/BGR.
+- Test pipeline xác nhận SGBM trái/phải, WLS và reproject đều không chạy ở LIVE;
+  mỗi bước chạy đúng 7 lần trong burst, tắt khi về LIVE và không chạy khi vẽ RESULT.
 - Đối chiếu 28 cặp dự đoán (7 vị trí × 2 mắt × 2 profile) trên ảnh 960×540:
   không lệch số lượng detection; mask IoU trung bình 0.999873, thấp nhất 0.998513
   so với PyTorch **cùng kích thước input**. So với Ultralytics NCNN: mask IoU 1.0.

@@ -107,6 +107,12 @@ class SegmentDepth(StereoDepth):
         rectified = cv2.remap(resized, self.maps[offset], self.maps[offset + 1], cv2.INTER_NEAREST)
         return rectified
 
+    def rectify_left(self, left):
+        """Left-eye preview without stereo matching or depth reconstruction."""
+        if (left.shape[1], left.shape[0]) != self.size:
+            left = cv2.resize(left, self.size, interpolation=cv2.INTER_LINEAR)
+        return cv2.remap(left, self.left_map_x, self.left_map_y, cv2.INTER_LINEAR)
+
     def rectify_right(self, right):
         """Right-eye preview only, using the reference's resize/remap operations."""
         if (right.shape[1], right.shape[0]) != self.size:
@@ -459,12 +465,15 @@ def compose_view(left, right, depth_color, detections, right_detections, guide,
     """A stable 2x2 layout: left/right eyes, reference depth, guidance/result."""
     left_view = draw_eye(left, detections, "LEFT - rectified", target_id, guide)
     right_view = draw_eye(right, right_detections, "RIGHT - rectified")
-    depth_view = depth_color.copy() if show_depth else np.zeros_like(left)
-    if show_depth:
+    depth_view = depth_color.copy() if show_depth and depth_color is not None else np.zeros_like(left)
+    if show_depth and depth_color is not None:
         for det in detections:
             contours, _ = cv2.findContours(det["mask"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(depth_view, contours, -1, UNKNOWN, 1)
-    text(depth_view, "DEPTH - Plasma (reference)" if show_depth else "DEPTH HIDDEN - press D", (12, 28))
+    depth_label = ("DEPTH HIDDEN - press D" if not show_depth else
+                   "DEPTH IDLE - press T to measure" if depth_color is None else
+                   "DEPTH - Plasma (reference)")
+    text(depth_view, depth_label, (12, 28))
     panel = np.full_like(left, (24, 23, 20))
     h, w = panel.shape[:2]
     scale = min(w / 960, h / 540)
@@ -520,7 +529,8 @@ def save_snapshot(directory, annotated, depth_color, depth, detections, index,
             continue
         if not cv2.imwrite(str(directory / f"{tag}_{suffix}.png"), img):
             raise RuntimeError(f"Cannot save snapshot in {directory}")
-    np.save(directory / f"{tag}_depth_m.npy", depth)
+    if depth is not None:
+        np.save(directory / f"{tag}_depth_m.npy", depth)
     for det in detections:
         if not cv2.imwrite(str(directory / f"{tag}_mask_{det['track_id']}.png"), det["mask"] * 255):
             raise RuntimeError(f"Cannot save instance mask in {directory}")
@@ -540,7 +550,8 @@ def refresh_view(frame, workflow, args, source, show_depth):
     frame["summary"] = dict(frame.get("summary", {}), state=workflow.state, target_id=workflow.target_id,
                             alignment=frame["guide"], burst=workflow.result,
                             left_frame=args.left_start + frame["index"],
-                            right_frame=args.right_start + frame["index"])
+                            right_frame=args.right_start + frame["index"],
+                            depth_computed=frame["depth"] is not None)
 
 
 def save_current(directory, frame):
@@ -551,16 +562,19 @@ def save_current(directory, frame):
 
 def process_stereo_pair(model, estimator, tracks, workflow, args, index, left, right,
                         right_mask=True):
-    """Shared camera/video algorithm. The backend only supplies YOLO masks."""
+    """Shared pipeline: compute reference stereo depth only during a T burst."""
     tick = time.perf_counter()
-    left_rect, _, depth_raw = estimator.process(left, right)
-    reference_color = depth_to_color(depth_raw, args.max_depth, args.unit)
-    depth = depth_raw * UNIT_TO_M[args.unit]
+    if workflow.state == "CAPTURING":
+        left_rect, _, depth_raw = estimator.process(left, right)
+        reference_color = depth_to_color(depth_raw, args.max_depth, args.unit)
+        depth = depth_raw * UNIT_TO_M[args.unit]
+    else:
+        left_rect = estimator.rectify_left(left)
+        depth = reference_color = None
     right_rect = estimator.rectify_right(right)
     image = left if args.seg_space == "original" else left_rect
     projector = estimator.rectify_mask if args.seg_space == "original" else None
-    capture_depth = depth if workflow.state == "CAPTURING" else None
-    detections = infer(model, image, capture_depth, float(estimator.Q[2, 3]), args, projector)
+    detections = infer(model, image, depth, float(estimator.Q[2, 3]), args, projector)
     tracks.update(detections, index)
     right_detections = []
     if right_mask:

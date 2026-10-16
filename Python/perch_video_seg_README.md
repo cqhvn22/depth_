@@ -5,8 +5,8 @@ StereoSGBM/WLS → YOLO → đánh giá kích thước/khoảng cách của `per
 Chạy trên Windows/Linux, không cần Picamera2.
 
 Phần depth dùng trực tiếp `StereoDepth` và `depth_to_color` từ
-`Calibration/video_depth_estimation.py`. `SegmentDepth` chỉ bổ sung phép biến đổi
-mask; kế thừa nguyên `process()`, không viết lại thuật toán depth. Mặc định
+`Calibration/video_depth_estimation.py`. `SegmentDepth` bổ sung phép biến đổi
+mask và rectify ảnh xem trước; kế thừa nguyên `process()`, không viết lại thuật toán depth. Mặc định
 `--downscale 0.5` giống file tham chiếu.
 
 ## Chạy ngay trên máy này
@@ -70,13 +70,17 @@ phát hiện của mắt phải, không phải ID tracking ghép với mắt tr�
 
 Quy trình giống chế độ trigger của `perch_detector.py`:
 
-1. LIVE: xem segmentation và gợi ý căn góc; chưa đo kích thước/kết luận đáp.
+1. LIVE: xem segmentation và gợi ý căn góc; không tính stereo depth
+   (bỏ SGBM/WLS/reproject để tăng FPS). Ô depth báo `DEPTH IDLE`.
 2. T: chuyển sang CAPTURING, dùng 7 cặp frame **sau khi bấm T**. Chỉ lấy số đo
    của ID thanh được chọn lúc bấm, không trộn nhiều thanh hoặc dữ liệu trước T.
 3. RESULT: lấy trung vị khoảng cách/dài/rộng, áp dụng ngưỡng của file gốc và giữ
    kết quả cùng hai ảnh cuối burst. Cần ít nhất 3 frame có depth hợp lệ. Nếu burst
    bị ngắt/hết video hoặc mất ID ở frame cuối thì trả INSUFFICIENT DATA.
 4. R để về LIVE; T từ RESULT để đo một burst mới từ vị trí video hiện tại.
+
+D chỉ ẩn/hiện ô depth. Snapshot LIVE không ghi depth mét `.npy` vì chưa đo;
+JSON ghi `depth_computed=false`. RESULT giữ depth cuối burst, không tính thêm.
 
 Thanh có ID `TARGET` được chọn theo mask lớn/confidence cao, ưu tiên giữ ID đó
 khi còn thấy. Nếu chưa có thanh ở thời điểm T, burst chọn thanh đầu tiên xuất hiện.

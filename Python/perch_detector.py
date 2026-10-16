@@ -2,6 +2,7 @@
 
 python3 Python/perch_detector.py
 T: next 7 fresh stereo pairs -> median -> frozen landing assessment.
+LIVE runs segmentation/alignment only; stereo depth runs only during the T burst.
 R: live/reset, SPACE: pause, D: depth, S: snapshot, Q/ESC: quit.
 See perch_detector_pi5_README.md. Defaults are in CONFIG below.
 """
@@ -205,6 +206,7 @@ def main():
             cv2.namedWindow(window, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(window, 1280, 720)
         print("[CONTROLS] T=burst, R=live/reset, SPACE=pause, D=depth, S=save, Q=quit")
+        print("[DEPTH] LIVE=off; T=reference SGBM/WLS for the next burst only", flush=True)
         while True:
             tick = time.perf_counter()
             if not workflow.paused:
